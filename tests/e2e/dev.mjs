@@ -207,6 +207,8 @@ try {
     const before = await serviceState();
     await clickPage();
     await page.keyboard.press('Control+t');
+    // Typed right away: no key may reach the page while the service opens the tab and the field takes over (before
+    // the panel moved the keyboard itself, one in about six runs lost a key here).
     await page.keyboard.type('example.com', { delay: 30 });
     await sleep(500);
     const typed = await address.evaluate((input) => ({ value: input.value, focused: document.activeElement === input }));
@@ -232,7 +234,7 @@ try {
   });
   await step('the strip\'s tabs: + opens one, a click shows one, × closes one', async () => {
     const before = await serviceState();
-    await panel.getByRole('button', { name: 'New tab' }).click();
+    await panel.getByRole('button', { name: 'New tab', exact: true }).click();
     await waitState('a new empty tab in front', (s) => s.tabs.length === before.tabs.length + 1 && s.url === 'about:blank', 10_000);
     await address.fill('example.com');
     await address.press('Enter');

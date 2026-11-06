@@ -4,7 +4,7 @@
 // input path as the page as HTML (service/mirror-input.ts), with `r` -2 and no document.
 import type { HostClient } from '@openchamber/sdk';
 
-import { keepLocal, modifiersOf, pasteChord } from './keys.ts';
+import { addressKey, keepLocal, modifiersOf, pasteChord } from './keys.ts';
 
 type Picture = { seq: number; mime?: string; data?: string; width?: number; height?: number; pageWidth?: number; pageHeight?: number; agentActive?: boolean };
 type Placed = { id: number; r: number; fx: number; fy: number; x: number; y: number };
@@ -28,7 +28,7 @@ export class PictureView {
   private active = true;
   private readonly resumers = new Set<() => void>();
 
-  constructor(parent: HTMLElement, private readonly host: HostClient, private readonly send: (events: Array<Record<string, unknown>>) => void) {
+  constructor(parent: HTMLElement, private readonly host: HostClient, private readonly send: (events: Array<Record<string, unknown>>) => void, private readonly address: () => void) {
     this.element = document.createElement('div');
     this.element.className = 'picture';
     this.element.tabIndex = 0;
@@ -146,6 +146,7 @@ export class PictureView {
       if (keepLocal(event, false) || event.key.length === 1 || /^(Arrow|Page|Home|End|Backspace|Delete|Enter|Escape|Tab| )/.test(event.key)) event.preventDefault();
       this.sentDown.add(event.code || event.key);
       this.emit([{ type: 'key', action: 'down', key: event.key, code: event.code, keyCode: event.keyCode, modifiers: modifiersOf(event) }]);
+      if (addressKey(event)) this.address();
     });
     target.addEventListener('keyup', (event) => {
       if (!this.sentDown.delete(event.code || event.key)) return;

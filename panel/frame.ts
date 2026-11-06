@@ -18,6 +18,7 @@
 //   parent → frame  { type: 'events', doc, reset, messages }   { type: 'res', url, mime?, data? (base64) | text?, error? }
 //                   { type: 'patches', doc, patches: [{ id, mime, data, dx, dy, w, h }] }
 //   frame → parent  { type: 'ready' }  { type: 'want', urls }  { type: 'resync' }  { type: 'input', doc, events }
+//                   { type: 'address' }
 import { startInput } from './frame-input.ts';
 
 type Desc = {
@@ -96,6 +97,7 @@ const input = startInput({
   nodeOf: (id) => nodes.get(id),
   patchAt: (x, y) => patchAt(x, y),
   send: (events) => post({ type: 'input', doc: shownDoc, events }),
+  address: () => post({ type: 'address' }),
 });
 
 const isRemote = (url: string): boolean => /^https?:/i.test(url);
@@ -373,6 +375,8 @@ const build = (desc: Desc, parentNs: string | null): Node | null => {
     const href = desc.a?.href ?? '';
     register(desc.i, element);
     linked.set(element, href);
+    // The service put the sheet in (it had not sent it in this run): kept, as one asked for would be.
+    if (desc.css !== undefined && isRemote(href)) sheets.set(href, desc.css);
     const text = sheets.get(href);
     if (text !== undefined) setCss(element, text);
     else want(href);
@@ -486,7 +490,7 @@ const reconcile = (parent: Node, list: Array<number | Desc>): boolean => {
 
 const linkedSheets = (desc: Desc | null, out: Set<string> = new Set()): Set<string> => {
   if (!desc || desc.x !== undefined) return out;
-  if (desc.n === 'link' && desc.a?.href && isRemote(desc.a.href) && !sheets.has(desc.a.href) && !failed.has(desc.a.href)) out.add(desc.a.href);
+  if (desc.n === 'link' && desc.css === undefined && desc.a?.href && isRemote(desc.a.href) && !sheets.has(desc.a.href) && !failed.has(desc.a.href)) out.add(desc.a.href);
   for (const child of desc.c ?? []) linkedSheets(child, out);
   for (const child of desc.s ?? []) linkedSheets(child, out);
   return out;

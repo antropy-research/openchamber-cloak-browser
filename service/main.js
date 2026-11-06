@@ -2773,6 +2773,8 @@ var PATCH_SCAN_MS = 250;
 var PATCH_MOVING_MS = 250;
 var PATCH_STILL_MS = 1000;
 var SNAPSHOT_BYTES_MAX = 5000000;
+var INLINE_CSS_BYTES_MAX = 2000000;
+var INLINE_CSS_WAIT_MS = 2000;
 var PATCH_BYTES_MAX = 2000000;
 var PATCH_QUALITY = 75;
 var isText2 = (mime) => mime === "text/css" || mime === "image/svg+xml" || mime.startsWith("text/");
@@ -2800,6 +2802,7 @@ class Mirror {
   coverage = 0;
   tooBig = false;
   patchesWantedAt = 0;
+  sheetsSent = new Set;
   constructor(browser) {
     this.browser = browser;
     browser.onShown((tab) => this.retarget(tab));
@@ -2906,6 +2909,8 @@ class Mirror {
         continue;
       }
       resources[url] = isText2(resource.mime) ? { mime: resource.mime, text: Buffer.from(resource.data, "base64").toString("utf8") } : resource;
+      if (resource.mime === "text/css")
+        this.sheetsSent.add(url);
       bytes += resource.data.length;
     }
     return { resources, later };
@@ -3016,8 +3021,13 @@ class Mirror {
         continue;
       }
       if (doc === this.doc && text) {
-        for (const message of JSON.parse(text))
+        for (const message of JSON.parse(text)) {
+          if (message.k === "snap")
+            await this.inlineSheets(message);
+          if (doc !== this.doc)
+            break;
           this.append(message);
+        }
         if (this.logBytes > LOG_BYTES_MAX)
           await this.restart(tab);
         this.wake();
@@ -3031,6 +3041,35 @@ class Mirror {
     }
     await this.stopRecorder(this.tab, this.contextId);
     this.contextId = null;
+  }
+  async inlineSheets(snapshot) {
+    const links = [];
+    const walk = (node) => {
+      if (!node || typeof node !== "object")
+        return;
+      if (node.n === "link" && node.a?.href && /^https?:/i.test(node.a.href) && !this.sheetsSent.has(node.a.href))
+        links.push(node);
+      for (const child of node.c ?? [])
+        walk(child);
+      for (const child of node.s ?? [])
+        walk(child);
+    };
+    walk(snapshot.root);
+    const until = Date.now() + INLINE_CSS_WAIT_MS;
+    const fetched = await Promise.all(links.map((link) => this.loadedResource(link.a?.href, until).catch(() => null)));
+    let bytes = 0;
+    links.forEach((link, index) => {
+      const found = fetched[index];
+      if (!found)
+        return;
+      const resource = found.mime === "text/css" ? found : absoluteCss(link.a?.href, { mime: "text/css", data: found.data });
+      const css = Buffer.from(resource.data, "base64").toString("utf8");
+      if (bytes + css.length > INLINE_CSS_BYTES_MAX)
+        return;
+      bytes += css.length;
+      link.css = css;
+      this.sheetsSent.add(link.a?.href);
+    });
   }
   async capturePatches(tab, doc) {
     const cdp = this.browser.cdp;
@@ -3090,6 +3129,30 @@ globalThis.__cloakMirror.start();`, contextId: executionContextId }, session, 1e
         break;
       this.cache.delete(key);
       this.cacheBytes -= value.data.length;
+    }
+  }
+  async loadedResource(url, until) {
+    for (;; ) {
+      const cached = this.cache.get(url);
+      if (cached)
+        return cached;
+      const tab = this.tab;
+      const cdp = this.browser.cdp;
+      if (!tab?.sessionId || !cdp)
+        return null;
+      try {
+        const { frameTree } = await cdp.send("Page.getFrameTree", {}, tab.sessionId);
+        const answer = await cdp.send("Page.getResourceContent", { frameId: frameTree.frame.id, url }, tab.sessionId, 3000);
+        const data = answer.base64Encoded ? answer.content : Buffer.from(answer.content, "utf8").toString("base64");
+        if (data.length > RESOURCE_BYTES_MAX * 1.4)
+          return null;
+        const resource = absoluteCss(url, { mime: await this.mimeOf(frameTree.frame.id, url, tab.sessionId), data });
+        this.remember(url, resource);
+        return resource;
+      } catch {}
+      if (Date.now() >= until)
+        return null;
+      await sleep3(100);
     }
   }
   async resource(url) {

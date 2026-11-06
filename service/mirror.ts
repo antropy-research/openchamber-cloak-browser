@@ -39,6 +39,13 @@ const PATCH_STILL_MS = 1000;
  * (a DOM of hundreds of thousands of nodes) is shown as a picture instead (`coverage` 1).
  */
 const SNAPSHOT_BYTES_MAX = 5_000_000;
+/**
+ * Style sheets put into a snapshot, at most: a panel shows a page only once its sheets are here, and one it has to ask
+ * for costs a round trip through OpenChamber each (0.8 to 1.5 s on a page with a few large ones).
+ */
+const INLINE_CSS_BYTES_MAX = 2_000_000;
+/** A sheet the page is still loading is waited for this long (a browser does not paint before its sheets either). */
+const INLINE_CSS_WAIT_MS = 2000;
 /** Patches in one answer, base64 included: the rest come with the next. */
 const PATCH_BYTES_MAX = 2_000_000;
 const PATCH_QUALITY = 75;
@@ -100,6 +107,11 @@ export class Mirror {
   private tooBig = false;
   /** When a panel last wanted the pictures: one that shows the whole page as a picture needs none. */
   private patchesWantedAt = 0;
+  /**
+   * Style sheets panels have had in this run (in a snapshot, or asked for): a later snapshot names them by address
+   * only, and a panel that lacks one asks for it.
+   */
+  private readonly sheetsSent = new Set<string>();
 
   constructor(private readonly browser: Browser) {
     browser.onShown((tab) => this.retarget(tab));
@@ -225,6 +237,7 @@ export class Mirror {
         continue;
       }
       resources[url] = isText(resource.mime) ? { mime: resource.mime, text: Buffer.from(resource.data, 'base64').toString('utf8') } : resource;
+      if (resource.mime === 'text/css') this.sheetsSent.add(url);
       bytes += resource.data.length;
     }
     return { resources, later };
@@ -349,7 +362,11 @@ export class Mirror {
         continue;
       }
       if (doc === this.doc && text) {
-        for (const message of JSON.parse(text) as unknown[]) this.append(message);
+        for (const message of JSON.parse(text) as unknown[]) {
+          if ((message as { k?: string }).k === 'snap') await this.inlineSheets(message as { root?: unknown });
+          if (doc !== this.doc) break;
+          this.append(message);
+        }
         if (this.logBytes > LOG_BYTES_MAX) await this.restart(tab);
         this.wake();
       }
@@ -362,6 +379,37 @@ export class Mirror {
     // Nobody watches: the recorder rests until a panel asks again.
     await this.stopRecorder(this.tab, this.contextId);
     this.contextId = null;
+  }
+
+  /**
+   * The style sheets a snapshot links that no panel has had in this run, put into it (`css` on the link), from what
+   * the page loaded: the panel shows the page at once instead of asking for each. At most INLINE_CSS_BYTES_MAX.
+   */
+  private async inlineSheets(snapshot: { root?: unknown }): Promise<void> {
+    type Node = { n?: string; a?: Record<string, string>; c?: Node[]; s?: Node[]; css?: string };
+    const links: Node[] = [];
+    const walk = (node: Node | undefined): void => {
+      if (!node || typeof node !== 'object') return;
+      if (node.n === 'link' && node.a?.href && /^https?:/i.test(node.a.href) && !this.sheetsSent.has(node.a.href)) links.push(node);
+      for (const child of node.c ?? []) walk(child);
+      for (const child of node.s ?? []) walk(child);
+    };
+    walk(snapshot.root as Node);
+    // All at once: the browser answers each from what the page loaded, or once it has.
+    const until = Date.now() + INLINE_CSS_WAIT_MS;
+    const fetched = await Promise.all(links.map((link) => this.loadedResource(link.a?.href as string, until).catch(() => null)));
+    let bytes = 0;
+    links.forEach((link, index) => {
+      const found = fetched[index];
+      if (!found) return;
+      // A sheet because the page links it as one, whatever type its server said.
+      const resource = found.mime === 'text/css' ? found : absoluteCss(link.a?.href as string, { mime: 'text/css', data: found.data });
+      const css = Buffer.from(resource.data, 'base64').toString('utf8');
+      if (bytes + css.length > INLINE_CSS_BYTES_MAX) return;
+      bytes += css.length;
+      link.css = css;
+      this.sheetsSent.add(link.a?.href as string);
+    });
   }
 
   /** Pictures of the elements HTML cannot carry that the window shows, where due and changed. */
@@ -426,6 +474,33 @@ export class Mirror {
       if (this.cacheBytes <= CACHE_BYTES_MAX) break;
       this.cache.delete(key);
       this.cacheBytes -= value.data.length;
+    }
+  }
+
+  /**
+   * A resource as the page has it, waiting until `until` while the page still loads it; null then. Never fetched
+   * again over the network (the page is fetching it already).
+   */
+  private async loadedResource(url: string, until: number): Promise<Resource | null> {
+    for (;;) {
+      const cached = this.cache.get(url);
+      if (cached) return cached;
+      const tab = this.tab;
+      const cdp = this.browser.cdp;
+      if (!tab?.sessionId || !cdp) return null;
+      try {
+        const { frameTree } = await cdp.send<{ frameTree: { frame: { id: string } } }>('Page.getFrameTree', {}, tab.sessionId);
+        const answer = await cdp.send<{ content: string; base64Encoded: boolean }>('Page.getResourceContent', { frameId: frameTree.frame.id, url }, tab.sessionId, 3000);
+        const data = answer.base64Encoded ? answer.content : Buffer.from(answer.content, 'utf8').toString('base64');
+        if (data.length > RESOURCE_BYTES_MAX * 1.4) return null;
+        const resource = absoluteCss(url, { mime: await this.mimeOf(frameTree.frame.id, url, tab.sessionId), data });
+        this.remember(url, resource);
+        return resource;
+      } catch {
+        // not loaded yet
+      }
+      if (Date.now() >= until) return null;
+      await sleep(100);
     }
   }
 

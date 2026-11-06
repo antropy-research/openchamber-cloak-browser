@@ -10,7 +10,7 @@
 //
 // Focus follows the page's (the `f` change), without taking the keyboard from OpenChamber when the frame does not
 // have it. Keys follow keys.ts.
-import { keepLocal, type Modifiers, modifiersOf, pasteChord } from './keys.ts';
+import { addressKey, keepLocal, type Modifiers, modifiersOf, pasteChord } from './keys.ts';
 
 type Placed = { id: number; r: number; fx: number; fy: number; x: number; y: number };
 export type FrameInput =
@@ -28,6 +28,8 @@ export type InputHooks = {
   /** A pictured frame under the point: it takes no pointer events of its own, so the path does not name it. */
   patchAt: (x: number, y: number) => Element | null;
   send: (events: FrameInput[]) => void;
+  /** A key for the address field (keys.ts, addressKey): the panel gives it the keyboard now. */
+  address: () => void;
 };
 
 /** A scroller waits this long after the user's last scroll before it takes the page's position. */
@@ -237,6 +239,7 @@ export const startInput = (hooks: InputHooks) => {
     keyText = event.key.length === 1 && !event.ctrlKey && !event.metaKey ? { text: event.key, at: Date.now() } : null;
     sentDown.add(event.code || event.key);
     send([{ type: 'key', action: 'down', key: event.key, code: event.code, keyCode: event.keyCode, modifiers: modifiersOf(event) }]);
+    if (addressKey(event)) hooks.address();
   }, true);
   window.addEventListener('keyup', (event) => {
     if (!sentDown.delete(event.code || event.key)) return;

@@ -11,6 +11,19 @@ export const modifiersOf = (event: MouseEvent | KeyboardEvent): Modifiers => ({ 
 export const pasteChord = (event: KeyboardEvent): boolean => (mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) && !event.altKey && (event.code === 'KeyV' || event.key.toLowerCase() === 'v');
 
 /**
+ * A key that gives the address field the keyboard (mod+L, Alt+D off a Mac, F6) or opens a tab for it (mod+T): the
+ * panel moves the keyboard to the field at once, so what is typed next goes there, not to the page while the service
+ * opens the tab (surface.ts, browserCommand, says the same keys).
+ */
+export const addressKey = (event: KeyboardEvent): boolean => {
+  const mod = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  const letter = event.key.length === 1 ? event.key.toLowerCase() : '';
+  if (mod && !event.altKey && !event.shiftKey && (letter === 'l' || letter === 't')) return true;
+  if (!mac && event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && letter === 'd') return true;
+  return event.key === 'F6' && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+};
+
+/**
  * Whether this window must not act on the key itself. `inField`: the keyboard is in a field here, where a chord moves
  * or deletes by word or line, as it does in the page.
  */

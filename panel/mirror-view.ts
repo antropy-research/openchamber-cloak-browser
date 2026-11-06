@@ -45,6 +45,8 @@ export type MirrorViewOptions = {
   onShown?: (shown: boolean) => void;
   /** The view became a picture or HTML again; `chosen`: the user asked for it. */
   onMode?: (mode: ViewMode) => void;
+  /** A key for the address field was pressed in the page: the field takes the keyboard now. */
+  onAddress?: () => void;
 };
 
 export class MirrorView {
@@ -53,6 +55,7 @@ export class MirrorView {
   private readonly host: HostClient;
   private readonly onShown: (shown: boolean) => void;
   private readonly onMode: (mode: ViewMode) => void;
+  private readonly onAddress: () => void;
   private readonly viewer: string;
   private readonly picture: PictureView;
   /** The user's choice for this page (null: none), and what the page itself calls for. */
@@ -90,6 +93,7 @@ export class MirrorView {
     this.host = options.host;
     this.onShown = options.onShown ?? (() => {});
     this.onMode = options.onMode ?? (() => {});
+    this.onAddress = options.onAddress ?? (() => {});
     this.viewer = options.viewer;
     this.element = document.createElement('div');
     this.element.className = 'view';
@@ -101,7 +105,7 @@ export class MirrorView {
     this.frame.srcdoc = FRAME_DOCUMENT;
     this.element.append(this.frame);
     parent.append(this.element);
-    this.picture = new PictureView(this.element, this.host, (events) => this.queueInput({ doc: -1, events }));
+    this.picture = new PictureView(this.element, this.host, (events) => this.queueInput({ doc: -1, events }), () => this.onAddress());
     window.addEventListener('message', (event) => {
       if (event.source !== this.frame.contentWindow) return;
       this.fromFrame(event.data as FrameMessage);
@@ -200,6 +204,9 @@ export class MirrorView {
         return;
       case 'input':
         if (typeof message.doc === 'number' && Array.isArray(message.events)) this.queueInput({ doc: message.doc, events: message.events });
+        return;
+      case 'address':
+        this.onAddress();
         return;
       case 'resync': {
         // The frame could not apply a change (a node it does not have): the page again, whole. The request waiting

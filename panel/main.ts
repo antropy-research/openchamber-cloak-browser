@@ -83,6 +83,8 @@ const view = new MirrorView(root, {
     asPicture.node.setAttribute('aria-pressed', String(mode.picture));
     asPicture.swap(ICONS.picture, mode.picture ? 'Show the page as HTML' : 'Show the page as a picture');
   },
+  // mod+L, mod+T, Alt+D, F6 in the page: the field takes the keyboard at once, before the service has answered.
+  onAddress: () => input?.focus(),
 });
 const dialogBox = document.createElement('div');
 dialogBox.className = 'dialog';
