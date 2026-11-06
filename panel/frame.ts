@@ -12,9 +12,13 @@
 // guard: no script element in any namespace, no event handler attribute, no javascript: address in any attribute (an
 // SVG animation's values included), no srcdoc, no frame with an address, no object or embed, no meta or base.
 //
+// The user's input is frame-input.ts's.
+//
 // The panel is the parent; messages carry `cloak: true`:
-//   parent → frame  { type: 'events', reset, messages }   { type: 'res', url, mime?, data? (base64) | text?, error? }
-//   frame → parent  { type: 'ready' }  { type: 'want', urls }  { type: 'resync' }
+//   parent → frame  { type: 'events', doc, reset, messages }   { type: 'res', url, mime?, data? (base64) | text?, error? }
+//   frame → parent  { type: 'ready' }  { type: 'want', urls }  { type: 'resync' }  { type: 'input', doc, events }
+import { startInput } from './frame-input.ts';
+
 type Desc = {
   i: number;
   x?: string;
@@ -26,9 +30,10 @@ type Desc = {
   sa?: string;
   css?: string;
   p?: { v?: string; k?: boolean; si?: number };
+  sc?: [number, number];
   patch?: 1;
 };
-type Snapshot = { k: 'snap'; url: string; title: string; quirks: boolean; root: Desc | null; adopted: string; scroll: [number, number] };
+type Snapshot = { k: 'snap'; url: string; title: string; quirks: boolean; root: Desc | null; adopted: string; scroll: [number, number]; focus?: number };
 type Op = [string, ...unknown[]];
 
 const NAMESPACES: Record<string, string> = {
@@ -66,16 +71,23 @@ const lazy = new WeakMap<Element, string>();
 let wantTimer: ReturnType<typeof setTimeout> | null = null;
 let restyleTimer: ReturnType<typeof setTimeout> | null = null;
 const arrived = new Set<string>();
-let lastLocalScroll = 0;
-/** The page's own scroll position, as last reported: put back after styles move the layout under it. */
-let pageScroll: [number, number] = [0, 0];
 let pageAdopted = '';
+/** The service's number of the document shown here: the user's input says which page it was made on. */
+let shownDoc = 0;
+/** Elements scrolled in the page when it was described: scrolled here once the page is shown. */
+let scrolledAtStart: Array<[number, [number, number]]> = [];
 /** A change could not be applied: nothing more is, until the next snapshot (asked for with `resync`). */
 let broken = false;
 /** A snapshot waiting for its style sheets, and what came after it. */
-let held: { snapshot: Snapshot; sheets: Set<string>; after: Op[][]; timer: ReturnType<typeof setTimeout> } | null = null;
+let held: { snapshot: Snapshot; doc: number; sheets: Set<string>; after: Op[][]; timer: ReturnType<typeof setTimeout> } | null = null;
 
 const post = (message: Record<string, unknown>): void => parent.postMessage({ cloak: true, ...message }, '*');
+
+const input = startInput({
+  idOf: (node) => ids.get(node),
+  nodeOf: (id) => nodes.get(id),
+  send: (events) => post({ type: 'input', doc: shownDoc, events }),
+});
 
 const isRemote = (url: string): boolean => /^https?:/i.test(url);
 
@@ -199,13 +211,16 @@ const setAttribute = (element: Element, name: string, value: string | null): voi
   }
 };
 
+/** A control's value and state from the page. A field the user is typing in here keeps its own text (the page has
+ * the same keys, and its echo would move the caret back); a box, a radio or a select takes the page's at once. */
 const applyForm = (element: Element, state: Desc['p']): void => {
-  if (!state || element === document.activeElement) return;
+  if (!state) return;
+  const typing = element === document.activeElement && (element instanceof HTMLTextAreaElement || (element instanceof HTMLInputElement && !/^(checkbox|radio|button|submit|reset|file|image|range|color)$/i.test(element.type)));
   if (element instanceof HTMLInputElement) {
-    if (state.v !== undefined && element.type !== 'file') element.value = state.v;
+    if (state.v !== undefined && element.type !== 'file' && !typing) element.value = state.v;
     if (state.k !== undefined) element.checked = state.k;
   } else if (element instanceof HTMLTextAreaElement) {
-    if (state.v !== undefined) element.value = state.v;
+    if (state.v !== undefined && !typing) element.value = state.v;
   } else if (element instanceof HTMLSelectElement) {
     if (state.si !== undefined) element.selectedIndex = state.si;
   }
@@ -314,6 +329,7 @@ const build = (desc: Desc, parentNs: string | null): Node | null => {
     }
   }
   if (desc.p) applyForm(element, desc.p);
+  if (desc.sc) scrolledAtStart.push([desc.i, desc.sc]);
   return element;
 };
 
@@ -364,7 +380,10 @@ const linkedSheets = (desc: Desc | null, out: Set<string> = new Set()): Set<stri
   return out;
 };
 
-const showSnapshot = (message: Snapshot): void => {
+const showSnapshot = (message: Snapshot, doc: number): void => {
+  shownDoc = doc;
+  input.reset();
+  scrolledAtStart = [];
   for (const node of nodes.values()) if (node instanceof Element) nearView.unobserve(node);
   nodes.clear();
   styles.clear();
@@ -378,22 +397,23 @@ const showSnapshot = (message: Snapshot): void => {
   if (!(root instanceof Element)) return;
   document.replaceChild(root, document.documentElement);
   setAdopted(message.adopted);
-  pageScroll = message.scroll;
-  lastLocalScroll = 0;
-  window.scrollTo(message.scroll[0], message.scroll[1]);
+  input.pageScrolled(0, message.scroll[0], message.scroll[1]);
+  for (const [id, [left, top]] of scrolledAtStart) input.pageScrolled(id, left, top);
+  scrolledAtStart = [];
+  if (message.focus) input.pageFocused(message.focus);
 };
 
 /** A new page: shown once its style sheets are here, or after HOLD_MS; what comes for it meanwhile waits too. */
-const snapshot = (message: Snapshot): void => {
+const snapshot = (message: Snapshot, doc: number): void => {
   if (held) clearTimeout(held.timer);
   const pending = linkedSheets(message.root);
   if (!pending.size) {
     held = null;
-    showSnapshot(message);
+    showSnapshot(message, doc);
     return;
   }
   for (const url of pending) want(url);
-  held = { snapshot: message, sheets: pending, after: [], timer: setTimeout(release, HOLD_MS) };
+  held = { snapshot: message, doc, sheets: pending, after: [], timer: setTimeout(release, HOLD_MS) };
 };
 
 const release = (): void => {
@@ -401,7 +421,7 @@ const release = (): void => {
   if (!current) return;
   clearTimeout(current.timer);
   held = null;
-  showSnapshot(current.snapshot);
+  showSnapshot(current.snapshot, current.doc);
   for (const ops of current.after) applyOps(ops);
 };
 
@@ -448,18 +468,12 @@ const apply = (op: Op): boolean => {
       if (element instanceof Element) applyForm(element, op[2] as Desc['p']);
       return true;
     }
-    case 'x': {
-      const id = op[1] as number;
-      if (id === 0) pageScroll = [op[2] as number, op[3] as number];
-      // The user scrolls here, and the page follows: its own report of a scroll waits until the user is done.
-      if (Date.now() - lastLocalScroll < 1000) return true;
-      if (id === 0) window.scrollTo(op[2] as number, op[3] as number);
-      else {
-        const element = nodes.get(id);
-        if (element instanceof Element) element.scrollTo(op[2] as number, op[3] as number);
-      }
+    case 'x':
+      input.pageScrolled(op[1] as number, op[2] as number, op[3] as number);
       return true;
-    }
+    case 'f':
+      input.pageFocused(op[1] as number);
+      return true;
     default:
       return true;
   }
@@ -486,8 +500,8 @@ const restyle = (): void => {
   for (const [element, css] of styleAttributes) if (names(css)) element.setAttribute('style', renderCss(css));
   if (pageAdopted && names(pageAdopted)) setAdopted(pageAdopted);
   for (const [root, css] of shadowCss) if (css && names(css)) root.adoptedStyleSheets = [sheet(css)];
-  // Styles move the layout: the page's own scroll position again, unless the user has scrolled here since.
-  if (!lastLocalScroll && (pageScroll[0] || pageScroll[1])) window.scrollTo(pageScroll[0], pageScroll[1]);
+  // Styles move the layout: the page's own scroll positions again, where the user has not scrolled here since.
+  input.reapply();
 };
 
 const resourceArrived = (url: string, mime: string, content: { data?: string; text?: string }): void => {
@@ -514,12 +528,12 @@ const resourceFailed = (url: string): void => {
 
 window.addEventListener('message', (event) => {
   if (event.source !== parent) return;
-  const data = event.data as { cloak?: boolean; type?: string; reset?: boolean; messages?: unknown[]; url?: string; mime?: string; data?: string; text?: string; error?: string };
+  const data = event.data as { cloak?: boolean; type?: string; doc?: number; reset?: boolean; messages?: unknown[]; url?: string; mime?: string; data?: string; text?: string; error?: string };
   if (!data?.cloak) return;
   if (data.type === 'events') {
     for (const message of data.messages ?? []) {
       const kind = (message as { k?: string }).k;
-      if (kind === 'snap') snapshot(message as Snapshot);
+      if (kind === 'snap') snapshot(message as Snapshot, data.doc ?? 0);
       else if (kind === 'ops') {
         const ops = (message as { ops: Op[] }).ops;
         if (held) held.after.push(ops);
@@ -539,16 +553,14 @@ document.addEventListener('securitypolicyviolation', (event) => {
   if (isRemote(url)) want(url);
 });
 
-// Not this frame's to follow: a link or a form would take the frame away from the mirror.
+// The page decides what a click does: a link, a form, a box or a disclosure here would act on its own. The page's
+// answer (a new page, a value, an attribute) comes back as changes.
 window.addEventListener('click', (event) => {
-  const target = event.target as Element | null;
-  if (target?.closest?.('a, area, button, input, label, summary, select, option')) event.preventDefault();
+  const target = event.composedPath()[0];
+  if (target instanceof Element && target.closest('a, area, button, input, label, summary')) event.preventDefault();
 }, true);
 window.addEventListener('auxclick', (event) => event.preventDefault(), true);
 window.addEventListener('submit', (event) => event.preventDefault(), true);
-window.addEventListener('scroll', () => {
-  lastLocalScroll = Date.now();
-}, { capture: true, passive: true });
 
 post({ type: 'ready' });
 

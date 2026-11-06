@@ -102,6 +102,48 @@ export class Mirror {
     return { run: this.run, tab, doc: this.doc, from: from === -1 ? this.seq + 1 : this.log[from].seq, seq: this.seq, reset, messages };
   }
 
+  /** The shown document's number: input made on another document's nodes is not applied to this one's. */
+  get document(): number {
+    return this.doc;
+  }
+
+  /**
+   * Where the user's pointer is in the page, on the node it was over in the panel (mirror-recorder.ts, locate); null
+   * when that node is gone, or the input was made on another document.
+   */
+  async locate(doc: number, id: number, rect: number, fx: number, fy: number): Promise<[number, number] | null> {
+    const value = await this.call(doc, `locate(${id}, ${rect}, ${fx}, ${fy})`);
+    return Array.isArray(value) && value.length === 2 && value.every((n) => typeof n === 'number' && Number.isFinite(n)) ? value as [number, number] : null;
+  }
+
+  /** A select's option the user picked in the panel's own list. */
+  async select(doc: number, id: number, index: number): Promise<boolean> {
+    return (await this.call(doc, `select(${id}, ${index})`)) === true;
+  }
+
+  /** A scroll the panel made that the page did not. */
+  async scrollTo(doc: number, id: number, left: number, top: number): Promise<boolean> {
+    return (await this.call(doc, `scrollTo(${id}, ${left}, ${top})`)) === true;
+  }
+
+  /** One of the recorder's calls (`__cloakMirror.<call>`), with numbers only, on the document `doc`. */
+  private async call(doc: number, call: string): Promise<unknown> {
+    const tab = this.tab;
+    const cdp = this.browser.cdp;
+    if (doc !== this.doc || this.contextId === null || !tab?.sessionId || !cdp) return null;
+    try {
+      const answer = await cdp.send<{ result?: { value?: unknown }; exceptionDetails?: unknown }>(
+        'Runtime.evaluate',
+        { expression: `globalThis.__cloakMirror ? globalThis.__cloakMirror.${call} : null`, contextId: this.contextId, returnByValue: true },
+        tab.sessionId,
+        3000,
+      );
+      return answer.exceptionDetails ? null : answer.result?.value ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   /** `POST /mirror/resources`: the bytes behind these addresses, as far as one answer holds them. */
   async resources(urls: string[]): Promise<{ resources: Record<string, Delivered | { error: string }>; later: string[] }> {
     const resources: Record<string, Delivered | { error: string }> = {};

@@ -249,7 +249,11 @@ export class Surface {
     return { frame: this.current(), seq: this.seq, title, agentActive: this.agentActive };
   }
 
-  async input(events: SurfaceInputEvent[]): Promise<void> {
+  /**
+   * The user's input, in order. Pointer and wheel positions are in the picture's pixels, or with `css` already in the
+   * page's CSS pixels (the panel's HTML page, mirror.ts, sends them so).
+   */
+  async input(events: SurfaceInputEvent[], options: { css?: boolean } = {}): Promise<void> {
     const cdp = await this.browser.ready();
     this.inputAt = Date.now();
     for (const event of events) {
@@ -266,7 +270,7 @@ export class Surface {
       if (event.type === 'key' && await this.shortcut(event)) continue;
       if (this.typeIntoAddress(event)) continue;
       const session = await this.browser.sessionOf(tab);
-      await this.browser.untilDialog(tab, this.dispatch(cdp, session, event));
+      await this.browser.untilDialog(tab, this.dispatch(cdp, session, event, options.css === true));
     }
   }
 
@@ -569,12 +573,12 @@ export class Surface {
     return (modifiers.alt ? 1 : 0) | (modifiers.ctrl || (this.mac && modifiers.meta) ? 2 : 0) | (!this.mac && modifiers.meta ? 4 : 0) | (modifiers.shift ? 8 : 0);
   }
 
-  private async dispatch(cdp: Cdp, sessionId: string, event: SurfaceInputEvent): Promise<void> {
+  private async dispatch(cdp: Cdp, sessionId: string, event: SurfaceInputEvent, css: boolean): Promise<void> {
     switch (event.type) {
       case 'pointer':
-        return this.pointer(cdp, sessionId, event);
+        return this.pointer(cdp, sessionId, event, css);
       case 'wheel': {
-        const { x, y } = this.toPage(event.x, event.y);
+        const { x, y } = css ? event : this.toPage(event.x, event.y);
         await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: event.deltaX, deltaY: event.deltaY, modifiers: this.modifiers(event.modifiers) }, sessionId);
         return;
       }
@@ -594,8 +598,8 @@ export class Surface {
     return { x: (x * this.cssWidth) / width, y: (y * this.cssHeight) / height };
   }
 
-  private async pointer(cdp: Cdp, sessionId: string, event: Extract<SurfaceInputEvent, { type: 'pointer' }>): Promise<void> {
-    const { x, y } = this.toPage(event.x, event.y);
+  private async pointer(cdp: Cdp, sessionId: string, event: Extract<SurfaceInputEvent, { type: 'pointer' }>, css: boolean): Promise<void> {
+    const { x, y } = css ? event : this.toPage(event.x, event.y);
     const modifiers = this.modifiers(event.modifiers);
     if (event.action === 'move') {
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: heldButton(event.buttons), buttons: event.buttons, modifiers }, sessionId);

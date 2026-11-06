@@ -9,7 +9,8 @@ import type { HostClient } from '@openchamber/sdk';
 
 type Answer = { run: string; tab: string | null; doc: number; from: number; seq: number; reset: boolean; messages: unknown[] };
 type Resource = { mime: string; data: string } | { mime: string; text: string } | { error: string };
-type FrameMessage = { cloak?: boolean; type?: string; urls?: unknown };
+type FrameMessage = { cloak?: boolean; type?: string; urls?: unknown; doc?: unknown; events?: unknown };
+type InputBatch = { doc: number; events: unknown[] };
 
 /** A wait under OpenChamber's 20 s for a page's request (GUEST_REQUEST_TIMEOUT_MS). */
 const WAIT_MS = 15_000;
@@ -44,6 +45,9 @@ export class MirrorView {
   private fetching = 0;
   private sizeTimer: ReturnType<typeof setTimeout> | null = null;
   private lastSize = '';
+  /** The user's input, in order: one request at a time, the rest waiting (a pointer move replaced by the next). */
+  private inputQueue: InputBatch[] = [];
+  private sendingInput = false;
 
   constructor(parent: HTMLElement, options: MirrorViewOptions) {
     this.host = options.host;
@@ -114,6 +118,9 @@ export class MirrorView {
           this.fetchWanted();
         }
         return;
+      case 'input':
+        if (typeof message.doc === 'number' && Array.isArray(message.events)) this.queueInput({ doc: message.doc, events: message.events });
+        return;
       case 'resync':
         // The frame could not apply a change (a node it does not have): the page again, whole. The request waiting
         // for news is answered at once, so the next one asks for the page.
@@ -163,11 +170,33 @@ export class MirrorView {
       messages = messages.slice(Math.max(0, this.after + 1 - answer.from));
     }
     this.after = answer.seq;
-    if (messages.length) this.toFrame({ type: 'events', reset: answer.reset, messages });
+    if (messages.length) this.toFrame({ type: 'events', doc: answer.doc, reset: answer.reset, messages });
     const shown = answer.tab !== null && (this.shown || messages.some((message) => (message as { k?: string }).k === 'snap'));
     if (shown !== this.shown) {
       this.shown = shown;
       this.onShown(shown);
+    }
+  }
+
+  private queueInput(batch: InputBatch): void {
+    const last = this.inputQueue.at(-1);
+    const isMove = (events: unknown[]) => events.length === 1 && (events[0] as { type?: string; action?: string }).type === 'pointer' && (events[0] as { action?: string }).action === 'move';
+    if (last && last.doc === batch.doc && isMove(last.events) && isMove(batch.events)) this.inputQueue[this.inputQueue.length - 1] = batch;
+    else if (last && last.doc === batch.doc && !isMove(last.events) && !isMove(batch.events) && last.events.length + batch.events.length <= 200) last.events.push(...batch.events);
+    else this.inputQueue.push(batch);
+    void this.sendInput();
+  }
+
+  private async sendInput(): Promise<void> {
+    if (this.sendingInput) return;
+    this.sendingInput = true;
+    try {
+      while (this.inputQueue.length) {
+        const batch = this.inputQueue.shift() as InputBatch;
+        await this.host.serviceRequest({ method: 'POST', path: '/mirror/input', body: JSON.stringify(batch) }).catch(() => {});
+      }
+    } finally {
+      this.sendingInput = false;
     }
   }
 

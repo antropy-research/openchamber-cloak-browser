@@ -7,10 +7,10 @@
 // outside the function.
 //
 // What goes out, as JSON:
-//   snapshot  { k: 'snap', url, title, quirks, root: Node, adopted: css, scroll: [x, y] }
+//   snapshot  { k: 'snap', url, title, quirks, root: Node, adopted: css, scroll: [x, y], focus: id | 0 }
 //   changes   { k: 'ops', ops: Op[] }
 // Node:  { i: id, x: text } for text; { i, n: tag, ns?: 's'|'m'|'h', a?: attrs, c?: Node[], s?: shadow Node[],
-//          sa?: shadow css, css?: style text, p?: form state, patch?: 1 } for elements
+//          sa?: shadow css, css?: style text, p?: form state, sc?: [left, top] scrolled, patch?: 1 } for elements
 // Op:    ['c', parentId, (id | Node)[]]   the parent's children now, existing ones by id, new ones whole
 //        ['S', hostId, (id | Node)[]]     the same for an open shadow root
 //        ['a', id, name, value | null]    an attribute set or removed
@@ -19,6 +19,11 @@
 //        ['A', css]                       the document's constructed (adopted) style sheets
 //        ['v', id, form state]            a form control's value
 //        ['x', id | 0, left, top]         a scroll position (0: the document)
+//        ['f', id | 0]                    the focused element (0: none)
+//
+// The service also calls in, with the ids the panel's input names: `locate` (where on the screen the user's pointer
+// is, on the element it was over in the panel), `select` (a select's option the user picked in the panel) and
+// `scrollTo` (a scroll the panel made that the page has not: find in page, for one).
 export function mirrorRecorder(): void {
   type Json = { [key: string]: unknown };
   const world = window as unknown as { __cloakMirror?: unknown };
@@ -185,6 +190,7 @@ export function mirrorRecorder(): void {
       }
     }
     if (Object.keys(attributes).length) out.a = attributes;
+    if (element.scrollTop || element.scrollLeft) out.sc = [Math.round(element.scrollLeft), Math.round(element.scrollTop)];
     if (out.patch) return out;
     const children: Json[] = [];
     for (const child of Array.from(element.childNodes)) {
@@ -378,6 +384,40 @@ export function mirrorRecorder(): void {
     if (ops.length) queue.push({ k: 'ops', ops });
   };
 
+  /** The focused element, inside shadow roots too; 0 for none (the body). */
+  const focusedId = (): number => {
+    let element: Element | null = document.activeElement;
+    while (element?.shadowRoot?.activeElement) element = element.shadowRoot.activeElement;
+    if (!element || element === document.body || element === document.documentElement || !sent.has(element)) return 0;
+    return ids.get(element) ?? 0;
+  };
+  let lastFocus = 0;
+  const onFocus = (): void => {
+    if (!running) return;
+    const id = focusedId();
+    if (id === lastFocus) return;
+    lastFocus = id;
+    queue.push({ k: 'ops', ops: [['f', id]] });
+  };
+  const onFocusIn = (): void => queueMicrotask(onFocus);
+  const onFocusOut = (): void => {
+    setTimeout(onFocus, 0);
+  };
+
+  /** A control's value as soon as it changes (typing, a click on a box), not at the next sweep. */
+  const onValue = (event: Event): void => {
+    if (!running) return;
+    const element = event.composedPath()[0];
+    if (!(element instanceof Element)) return;
+    const id = ids.get(element);
+    const entry = id ? controls.get(id) : undefined;
+    if (!id || !entry) return;
+    const state = formState(element);
+    if (state === null || state === entry.state) return;
+    entry.state = state;
+    queue.push({ k: 'ops', ops: [['v', id, JSON.parse(state)]] });
+  };
+
   const scrolls = new Map<number, [number, number]>();
   let scrollTimer: ReturnType<typeof setTimeout> | null = null;
   const onScroll = (event: Event): void => {
@@ -400,6 +440,7 @@ export function mirrorRecorder(): void {
     controls.clear();
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
+    lastFocus = focusedId();
     return {
       k: 'snap',
       url: location.href,
@@ -408,6 +449,7 @@ export function mirrorRecorder(): void {
       root,
       adopted,
       scroll: [Math.round(window.scrollX), Math.round(window.scrollY)],
+      focus: lastFocus,
     };
   };
 
@@ -423,6 +465,10 @@ export function mirrorRecorder(): void {
       observer.observe(document, { childList: true, attributes: true, characterData: true, subtree: true });
       if (!sweeper) {
         document.addEventListener('scroll', onScroll, { capture: true, passive: true });
+        document.addEventListener('focusin', onFocusIn, true);
+        document.addEventListener('focusout', onFocusOut, true);
+        document.addEventListener('input', onValue, true);
+        document.addEventListener('change', onValue, true);
         sweeper = setInterval(sweep, 400);
       }
     },
@@ -432,6 +478,10 @@ export function mirrorRecorder(): void {
       if (sweeper) clearInterval(sweeper);
       sweeper = null;
       document.removeEventListener('scroll', onScroll, { capture: true });
+      document.removeEventListener('focusin', onFocusIn, true);
+      document.removeEventListener('focusout', onFocusOut, true);
+      document.removeEventListener('input', onValue, true);
+      document.removeEventListener('change', onValue, true);
       queue = [];
     },
     /** Everything since the last drain, as one JSON text ('' when there is nothing). */
@@ -441,6 +491,56 @@ export function mirrorRecorder(): void {
       const out = JSON.stringify(queue);
       queue = [];
       return out;
+    },
+    /**
+     * Where the user's pointer is in the page's window, in CSS pixels: on the element it was over in the panel, at
+     * the same place in it (fractions of its box, or of one of its line boxes for text that wraps). An element out
+     * of the window is scrolled into it first, as little as it takes. Null when the element is gone or has no box.
+     */
+    locate(id: number, rect: number, fx: number, fy: number): [number, number] | null {
+      const node = byId.get(id)?.deref();
+      const element = node?.nodeType === Node.ELEMENT_NODE ? node as Element : node?.parentElement ?? null;
+      if (!element || !element.isConnected) return null;
+      const box = (): DOMRect | null => {
+        const rects = element.getClientRects();
+        const chosen = rect >= 0 && rect < rects.length ? rects[rect] : element.getBoundingClientRect();
+        return chosen.width > 0 || chosen.height > 0 ? chosen : null;
+      };
+      const point = (chosen: DOMRect): [number, number] => [
+        chosen.left + Math.min(Math.max(fx, 0), 1) * chosen.width,
+        chosen.top + Math.min(Math.max(fy, 0), 1) * chosen.height,
+      ];
+      let chosen = box();
+      if (!chosen) return null;
+      let [x, y] = point(chosen);
+      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) {
+        element.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+        chosen = box();
+        if (!chosen) return null;
+        [x, y] = point(chosen);
+      }
+      return [Math.round(x * 100) / 100, Math.round(y * 100) / 100];
+    },
+    /** A select's option, picked in the panel's own list: selected here, with the events a pick sends. */
+    select(id: number, index: number): boolean {
+      const element = byId.get(id)?.deref();
+      if (!(element instanceof HTMLSelectElement) || element.disabled || index < -1 || index >= element.options.length) return false;
+      if (element.selectedIndex === index) return true;
+      element.selectedIndex = index;
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    },
+    /** A scroll the panel made that the page did not (find in page): the page follows. 0 is the document. */
+    scrollTo(id: number, left: number, top: number): boolean {
+      if (id === 0) {
+        window.scrollTo({ left, top, behavior: 'instant' });
+        return true;
+      }
+      const element = byId.get(id)?.deref();
+      if (!(element instanceof Element)) return false;
+      element.scrollTo({ left, top, behavior: 'instant' });
+      return true;
     },
     /** The live node behind an id (the service maps the user's input with it). */
     node(id: number): Node | null {

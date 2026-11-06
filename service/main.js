@@ -2093,6 +2093,8 @@ function mirrorRecorder() {
     }
     if (Object.keys(attributes).length)
       out.a = attributes;
+    if (element.scrollTop || element.scrollLeft)
+      out.sc = [Math.round(element.scrollLeft), Math.round(element.scrollTop)];
     if (out.patch)
       return out;
     const children = [];
@@ -2312,6 +2314,44 @@ function mirrorRecorder() {
     if (ops.length)
       queue.push({ k: "ops", ops });
   };
+  const focusedId = () => {
+    let element = document.activeElement;
+    while (element?.shadowRoot?.activeElement)
+      element = element.shadowRoot.activeElement;
+    if (!element || element === document.body || element === document.documentElement || !sent.has(element))
+      return 0;
+    return ids.get(element) ?? 0;
+  };
+  let lastFocus = 0;
+  const onFocus = () => {
+    if (!running)
+      return;
+    const id = focusedId();
+    if (id === lastFocus)
+      return;
+    lastFocus = id;
+    queue.push({ k: "ops", ops: [["f", id]] });
+  };
+  const onFocusIn = () => queueMicrotask(onFocus);
+  const onFocusOut = () => {
+    setTimeout(onFocus, 0);
+  };
+  const onValue = (event) => {
+    if (!running)
+      return;
+    const element = event.composedPath()[0];
+    if (!(element instanceof Element))
+      return;
+    const id = ids.get(element);
+    const entry = id ? controls.get(id) : undefined;
+    if (!id || !entry)
+      return;
+    const state = formState(element);
+    if (state === null || state === entry.state)
+      return;
+    entry.state = state;
+    queue.push({ k: "ops", ops: [["v", id, JSON.parse(state)]] });
+  };
   const scrolls = new Map;
   let scrollTimer = null;
   const onScroll = (event) => {
@@ -2336,6 +2376,7 @@ function mirrorRecorder() {
     controls.clear();
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
+    lastFocus = focusedId();
     return {
       k: "snap",
       url: location.href,
@@ -2343,7 +2384,8 @@ function mirrorRecorder() {
       quirks: document.compatMode === "BackCompat",
       root,
       adopted,
-      scroll: [Math.round(window.scrollX), Math.round(window.scrollY)]
+      scroll: [Math.round(window.scrollX), Math.round(window.scrollY)],
+      focus: lastFocus
     };
   };
   observer = new MutationObserver(flush);
@@ -2357,6 +2399,10 @@ function mirrorRecorder() {
       observer.observe(document, { childList: true, attributes: true, characterData: true, subtree: true });
       if (!sweeper) {
         document.addEventListener("scroll", onScroll, { capture: true, passive: true });
+        document.addEventListener("focusin", onFocusIn, true);
+        document.addEventListener("focusout", onFocusOut, true);
+        document.addEventListener("input", onValue, true);
+        document.addEventListener("change", onValue, true);
         sweeper = setInterval(sweep, 400);
       }
     },
@@ -2367,6 +2413,10 @@ function mirrorRecorder() {
         clearInterval(sweeper);
       sweeper = null;
       document.removeEventListener("scroll", onScroll, { capture: true });
+      document.removeEventListener("focusin", onFocusIn, true);
+      document.removeEventListener("focusout", onFocusOut, true);
+      document.removeEventListener("input", onValue, true);
+      document.removeEventListener("change", onValue, true);
       queue = [];
     },
     drain() {
@@ -2376,6 +2426,55 @@ function mirrorRecorder() {
       const out = JSON.stringify(queue);
       queue = [];
       return out;
+    },
+    locate(id, rect, fx, fy) {
+      const node = byId.get(id)?.deref();
+      const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement ?? null;
+      if (!element || !element.isConnected)
+        return null;
+      const box = () => {
+        const rects = element.getClientRects();
+        const chosen = rect >= 0 && rect < rects.length ? rects[rect] : element.getBoundingClientRect();
+        return chosen.width > 0 || chosen.height > 0 ? chosen : null;
+      };
+      const point = (chosen) => [
+        chosen.left + Math.min(Math.max(fx, 0), 1) * chosen.width,
+        chosen.top + Math.min(Math.max(fy, 0), 1) * chosen.height
+      ];
+      let chosen = box();
+      if (!chosen)
+        return null;
+      let [x, y] = point(chosen);
+      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) {
+        element.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+        chosen = box();
+        if (!chosen)
+          return null;
+        [x, y] = point(chosen);
+      }
+      return [Math.round(x * 100) / 100, Math.round(y * 100) / 100];
+    },
+    select(id, index) {
+      const element = byId.get(id)?.deref();
+      if (!(element instanceof HTMLSelectElement) || element.disabled || index < -1 || index >= element.options.length)
+        return false;
+      if (element.selectedIndex === index)
+        return true;
+      element.selectedIndex = index;
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    },
+    scrollTo(id, left, top) {
+      if (id === 0) {
+        window.scrollTo({ left, top, behavior: "instant" });
+        return true;
+      }
+      const element = byId.get(id)?.deref();
+      if (!(element instanceof Element))
+        return false;
+      element.scrollTo({ left, top, behavior: "instant" });
+      return true;
     },
     node(id) {
       return byId.get(id)?.deref() ?? null;
@@ -2454,6 +2553,31 @@ class Mirror {
     const from = reset ? snapshot : this.log.findIndex((entry) => entry.seq > after);
     const messages = from === -1 ? [] : this.log.slice(from).map((entry) => entry.message);
     return { run: this.run, tab, doc: this.doc, from: from === -1 ? this.seq + 1 : this.log[from].seq, seq: this.seq, reset, messages };
+  }
+  get document() {
+    return this.doc;
+  }
+  async locate(doc, id, rect, fx, fy) {
+    const value = await this.call(doc, `locate(${id}, ${rect}, ${fx}, ${fy})`);
+    return Array.isArray(value) && value.length === 2 && value.every((n) => typeof n === "number" && Number.isFinite(n)) ? value : null;
+  }
+  async select(doc, id, index) {
+    return await this.call(doc, `select(${id}, ${index})`) === true;
+  }
+  async scrollTo(doc, id, left, top) {
+    return await this.call(doc, `scrollTo(${id}, ${left}, ${top})`) === true;
+  }
+  async call(doc, call) {
+    const tab = this.tab;
+    const cdp = this.browser.cdp;
+    if (doc !== this.doc || this.contextId === null || !tab?.sessionId || !cdp)
+      return null;
+    try {
+      const answer = await cdp.send("Runtime.evaluate", { expression: `globalThis.__cloakMirror ? globalThis.__cloakMirror.${call} : null`, contextId: this.contextId, returnByValue: true }, tab.sessionId, 3000);
+      return answer.exceptionDetails ? null : answer.result?.value ?? null;
+    } catch {
+      return null;
+    }
   }
   async resources(urls) {
     const resources = {};
@@ -2697,6 +2821,116 @@ var guessMime = (url) => {
   }[ext] ?? "application/octet-stream";
 };
 
+// service/mirror-input.ts
+var EVENTS_MAX = 500;
+var TEXT_MAX = 1e5;
+var num = (value) => typeof value === "number" && Number.isFinite(value);
+var int = (value) => Number.isInteger(value);
+var str = (value, max) => typeof value === "string" && value.length <= max;
+var readModifiers2 = (value) => {
+  const m = value;
+  if (!m || typeof m !== "object")
+    return null;
+  return { alt: m.alt === true, ctrl: m.ctrl === true, meta: m.meta === true, shift: m.shift === true };
+};
+var readPlaced = (e) => {
+  if (!int(e.id) || !int(e.r) || !num(e.fx) || !num(e.fy) || !num(e.x) || !num(e.y))
+    return null;
+  return { id: e.id, r: e.r, fx: e.fx, fy: e.fy, x: e.x, y: e.y };
+};
+var readEvent2 = (value) => {
+  const e = value;
+  if (!e || typeof e !== "object")
+    return null;
+  switch (e.type) {
+    case "pointer": {
+      const placed = readPlaced(e);
+      const modifiers = readModifiers2(e.modifiers);
+      if (!placed || !modifiers || e.action !== "down" && e.action !== "up" && e.action !== "move" || !int(e.button) || !int(e.buttons))
+        return null;
+      return { type: "pointer", action: e.action, button: e.button, buttons: e.buttons, modifiers, ...placed };
+    }
+    case "wheel": {
+      const placed = readPlaced(e);
+      const modifiers = readModifiers2(e.modifiers);
+      if (!placed || !modifiers || !num(e.deltaX) || !num(e.deltaY))
+        return null;
+      return { type: "wheel", deltaX: e.deltaX, deltaY: e.deltaY, modifiers, ...placed };
+    }
+    case "key": {
+      const modifiers = readModifiers2(e.modifiers);
+      if (!modifiers || e.action !== "down" && e.action !== "up" || !str(e.key, 64) || !str(e.code, 64))
+        return null;
+      return { type: "key", action: e.action, key: e.key, code: e.code, ...int(e.keyCode) && e.keyCode >= 0 && e.keyCode <= 255 ? { keyCode: e.keyCode } : {}, modifiers };
+    }
+    case "text":
+      return str(e.text, TEXT_MAX) && e.text ? { type: "text", text: e.text } : null;
+    case "select":
+      return int(e.id) && int(e.index) ? { type: "select", id: e.id, index: e.index } : null;
+    case "scroll":
+      return int(e.id) && num(e.left) && num(e.top) ? { type: "scroll", id: e.id, left: Math.round(e.left), top: Math.round(e.top) } : null;
+    default:
+      return null;
+  }
+};
+var readMirrorInput = (body) => {
+  const b = body;
+  if (!b || typeof b !== "object" || !int(b.doc) || !Array.isArray(b.events) || b.events.length > EVENTS_MAX)
+    return null;
+  const events = [];
+  for (const value of b.events) {
+    const event = readEvent2(value);
+    if (!event)
+      return null;
+    events.push(event);
+  }
+  return { doc: b.doc, events };
+};
+var applyMirrorInput = async (input, mirror, surface) => {
+  let batch = [];
+  const flush = async () => {
+    if (!batch.length)
+      return;
+    const events = batch;
+    batch = [];
+    await surface.input(events, { css: true });
+  };
+  for (const event of input.events) {
+    switch (event.type) {
+      case "pointer":
+      case "wheel": {
+        const current = input.doc === mirror.document;
+        if (!current && !(event.type === "pointer" && event.action === "up"))
+          continue;
+        const placed = current ? await mirror.locate(input.doc, event.id, event.r, event.fx, event.fy) : null;
+        const [x, y] = placed ?? [event.x, event.y];
+        if (event.type === "pointer") {
+          batch.push({ type: "pointer", action: event.action, x, y, button: event.button, buttons: event.buttons, modifiers: event.modifiers });
+        } else {
+          batch.push({ type: "wheel", x, y, deltaX: event.deltaX, deltaY: event.deltaY, modifiers: event.modifiers });
+        }
+        break;
+      }
+      case "key":
+        batch.push({ type: "key", action: event.action, key: event.key, code: event.code, ...event.keyCode !== undefined ? { keyCode: event.keyCode } : {}, modifiers: event.modifiers });
+        break;
+      case "text":
+        batch.push({ type: "text", text: event.text });
+        break;
+      case "select":
+        await flush();
+        await mirror.select(input.doc, event.id, event.index);
+        break;
+      case "scroll":
+        await flush();
+        await mirror.scrollTo(input.doc, event.id, event.left, event.top);
+        break;
+      default:
+    }
+  }
+  await flush();
+};
+
 // service/surface.ts
 import { deflateSync } from "node:zlib";
 var QUALITY = 80;
@@ -2923,7 +3157,7 @@ class Surface {
     this.shownTitle = title;
     return { frame: this.current(), seq: this.seq, title, agentActive: this.agentActive };
   }
-  async input(events) {
+  async input(events, options = {}) {
     const cdp = await this.browser.ready();
     this.inputAt = Date.now();
     for (const event of events) {
@@ -2939,7 +3173,7 @@ class Surface {
       if (this.typeIntoAddress(event))
         continue;
       const session = await this.browser.sessionOf(tab);
-      await this.browser.untilDialog(tab, this.dispatch(cdp, session, event));
+      await this.browser.untilDialog(tab, this.dispatch(cdp, session, event, options.css === true));
     }
   }
   stripState() {
@@ -3224,12 +3458,12 @@ class Surface {
   modifiers(modifiers) {
     return (modifiers.alt ? 1 : 0) | (modifiers.ctrl || this.mac && modifiers.meta ? 2 : 0) | (!this.mac && modifiers.meta ? 4 : 0) | (modifiers.shift ? 8 : 0);
   }
-  async dispatch(cdp, sessionId, event) {
+  async dispatch(cdp, sessionId, event, css) {
     switch (event.type) {
       case "pointer":
-        return this.pointer(cdp, sessionId, event);
+        return this.pointer(cdp, sessionId, event, css);
       case "wheel": {
-        const { x, y } = this.toPage(event.x, event.y);
+        const { x, y } = css ? event : this.toPage(event.x, event.y);
         await cdp.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: event.deltaX, deltaY: event.deltaY, modifiers: this.modifiers(event.modifiers) }, sessionId);
         return;
       }
@@ -3247,8 +3481,8 @@ class Surface {
     const height = this.frame?.height ?? this.deviceHeight;
     return { x: x * this.cssWidth / width, y: y * this.cssHeight / height };
   }
-  async pointer(cdp, sessionId, event) {
-    const { x, y } = this.toPage(event.x, event.y);
+  async pointer(cdp, sessionId, event, css) {
+    const { x, y } = css ? event : this.toPage(event.x, event.y);
     const modifiers = this.modifiers(event.modifiers);
     if (event.action === "move") {
       await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: heldButton(event.buttons), buttons: event.buttons, modifiers }, sessionId);
@@ -3412,6 +3646,12 @@ var route = async (req, res) => {
       const after = Number(url.searchParams.get("after")) || 0;
       const wait = Number(url.searchParams.get("wait")) || 0;
       return send(res, 200, await mirror.events(after, wait, url.searchParams.get("run") ?? ""));
+    }
+    case "POST /mirror/input": {
+      const input = readMirrorInput(await readJson(req));
+      if (!input)
+        return send(res, 400, { ok: false, error: "Not mirror input" });
+      return command(res, () => applyMirrorInput(input, mirror, surface));
     }
     case "POST /mirror/wake":
       mirror.wake();

@@ -29,6 +29,7 @@ import { toUrl } from './address.ts';
 import { Agent } from './agent.ts';
 import { Browser } from './browser.ts';
 import { Mirror } from './mirror.ts';
+import { applyMirrorInput, readMirrorInput } from './mirror-input.ts';
 import { Surface } from './surface.ts';
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
@@ -133,6 +134,12 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
       const after = Number(url.searchParams.get('after')) || 0;
       const wait = Number(url.searchParams.get('wait')) || 0;
       return send(res, 200, await mirror.events(after, wait, url.searchParams.get('run') ?? ''));
+    }
+    case 'POST /mirror/input': {
+      // The user's pointer, wheel, keys and text on the page in the panel, made real input in the page.
+      const input = readMirrorInput(await readJson(req));
+      if (!input) return send(res, 400, { ok: false, error: 'Not mirror input' });
+      return command(res, () => applyMirrorInput(input, mirror, surface));
     }
     case 'POST /mirror/wake':
       // A view lost its place: the requests waiting for news are answered now, and it asks for the page again.
