@@ -66,11 +66,25 @@ const PAGES: Record<string, string> = {
   '/form': `<title>ready</title><input id="f" style="position:absolute;left:20px;top:20px;width:300px;height:30px;font:16px sans-serif">
     <script>document.getElementById('f').addEventListener('input', (e) => { document.title = 'value:' + e.target.value; });</script>`,
   '/words': `<p style="position:absolute;left:20px;top:20px;margin:0;font:32px/40px monospace">alpha <span id="w">beta</span> gamma</p>
-    <script>const r = document.getElementById('w').getBoundingClientRect(); document.title = JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 });</script>`,
+    <script>const r = document.getElementById('w').getBoundingClientRect(); document.title = JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2, at: location.search });</script>`,
   '/scroll': `<title>scroll:0</title><div style="height:5000px">tall</div>
     <script>addEventListener('scroll', () => { document.title = 'scroll:' + Math.round(scrollY); });</script>`,
-  '/popup': '<title>popup</title><a href="/b" target="_blank" style="position:absolute;left:20px;top:20px;font:20px/24px sans-serif">open</a>',
+  '/popup': `<title>popup</title><a href="/b" target="_blank" style="position:absolute;left:20px;top:20px;font:20px/24px sans-serif">open</a>
+    <button style="position:absolute;left:20px;top:80px;width:120px;height:30px" onclick="window.open('/b')">window.open</button>`,
   '/ratio': '<script>document.title = "ratio:" + devicePixelRatio;</script>',
+  '/alert': `<title>alert page</title><button id="b" style="position:absolute;left:20px;top:20px;width:120px;height:30px" onclick="alert('hello'); document.title = 'after-alert'">alert</button>`,
+  '/prompt': `<title>prompt page</title><button id="b" style="position:absolute;left:20px;top:20px;width:120px;height:30px" onclick="document.title = 'name:' + prompt('Name?', 'x')">prompt</button>`,
+  // What the agent's actions act on. The button reports whether its click was a real one.
+  '/agent': `<title>agent page</title>
+    <h1>Agent page</h1>
+    <input id="f" aria-label="Name" style="width:200px">
+    <button id="save" style="color: rgb(255, 0, 0)" onclick="document.title = 'trusted:' + event.isTrusted">Save</button>
+    <select id="s" aria-label="Pick" onchange="document.title = 'picked:' + this.value"><option value="a">Alpha</option><option value="b">Beta</option></select>
+    <button id="pop" onclick="alert('from the agent'); document.title = 'agent-alert-done'">Alert</button>
+    <p id="seen"></p>
+    <div style="height:4000px"></div><p id="end">The end</p>
+    <script>setInterval(() => { const seen = document.getElementById('seen'); const now = 'visibility:' + document.visibilityState; if (seen.textContent !== now) seen.textContent = now; }, 50);</script>
+    <script>document.getElementById('f').addEventListener('input', (e) => { document.title = 'value:' + e.target.value; });</script>`,
 };
 
 let pages: http.Server;
@@ -108,7 +122,11 @@ const startService = async (dataDir: string): Promise<Service> => {
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
-  child.stderr?.on('data', (chunk) => { stderr += chunk; });
+  child.stderr?.on('data', (chunk) => {
+    stderr += chunk;
+    // CLOAK_TEST_STDERR=1 shows what the service says as it says it (debugging a hang).
+    if (process.env.CLOAK_TEST_STDERR) process.stderr.write(`[service ${port}] ${chunk}`);
+  });
   const service = { child, base: `http://127.0.0.1:${port}`, dataDir, stderr: () => stderr };
   await waitFor('the service to listen', () => fetch(`${service.base}/health`, { headers: { authorization: `Bearer ${TOKEN}` } }), (res) => res.ok, 15_000);
   return service;
@@ -327,4 +345,343 @@ describe('the browser process', () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   }, 120_000);
+});
+
+describe('tabs, dialogs, and the agent\'s browser', () => {
+  let service: Service;
+  let dataDir: string;
+  const DPR = 1;
+
+  type Full = State & { tabs: Array<{ id: string; title: string; url: string; shown: boolean; agent: boolean }>; dialog: { type: string; message: string } | null };
+  const full = async (): Promise<Full> => (await api(service, 'GET', '/state')).json() as Promise<Full>;
+  const go = async (path: string, title?: string) => {
+    expect(await (await api(service, 'POST', '/navigate', { url: `${site}${path}` })).json()).toEqual({ ok: true });
+    return waitFor(`${path} to load`, () => full(), (now) => now.url === `${site}${path}` && !now.loading && (title === undefined || now.title === title));
+  };
+  const click = async (x: number, y: number, modifiers = NO_KEYS) => {
+    const events = [
+      { type: 'pointer', action: 'down', x: x * DPR, y: y * DPR, button: 0, buttons: 1, modifiers },
+      { type: 'pointer', action: 'up', x: x * DPR, y: y * DPR, button: 0, buttons: 0, modifiers },
+    ];
+    expect((await api(service, 'POST', '/surface/input', { events })).status).toBe(204);
+  };
+  let requests = 0;
+  /** One action, as OpenChamber posts it for the agent's `openchamber_web` tool. */
+  const act = async (action: string, parameters: Record<string, unknown> = {}, sessionId: string | null = 'ses_agent') => {
+    requests += 1;
+    const res = await api(service, 'POST', '/browser-control', { requestId: `browser-${requests}`, action, parameters, context: { directory: '/tmp', sessionId } });
+    expect(res.status).toBe(200);
+    return res.json() as Promise<{ ok: true; data: Record<string, any> } | { ok: false; error: string }>;
+  };
+  const ok = async (action: string, parameters: Record<string, unknown> = {}, sessionId: string | null = 'ses_agent') => {
+    const answer = await act(action, parameters, sessionId);
+    if (!answer.ok) throw new Error(`${action}: ${answer.error}`);
+    return answer.data;
+  };
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cloak-test-'));
+    service = await startService(dataDir);
+    await api(service, 'POST', '/viewer', { dpr: DPR, mac: false });
+    await api(service, 'POST', '/surface/resize', { width: 900, height: 700 });
+    await waitFor('the browser to run', () => full(), (s) => s.phase === 'running' && s.url === `${site}/`, 60_000);
+  });
+
+  afterAll(async () => {
+    if (service) await stopService(service);
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  // AGENTS.md: Command-click opens a new tab and does not take over the view.
+  /** The link's tab opened and loaded; a tab that comes to the front does so once it is set up, so wait that long. */
+  const openedBehind = async (count: number) => {
+    await waitFor('the link\'s tab, loaded', () => full(), (s) => s.tabs.length === count && s.tabs.filter((tab) => tab.url === `${site}/b` && tab.title === 'page b').length === count - 1);
+    await sleep(1000);
+    const now = await full();
+    expect(now.url).toBe(`${site}/popup`);
+    expect(now.tabs.filter((tab) => tab.shown).map((tab) => tab.url)).toEqual([`${site}/popup`]);
+    return now;
+  };
+
+  test('a click with Control opens the link in a tab behind; the picture stays', async () => {
+    await go('/popup', 'popup');
+    await click(40, 32, { ...NO_KEYS, ctrl: true });
+    await openedBehind(2);
+  }, 30_000);
+
+  test('so do Command on a Mac, the middle button, and a page\'s own window.open under Control', async () => {
+    await api(service, 'POST', '/viewer', { dpr: DPR, mac: true });
+    await click(40, 32, { ...NO_KEYS, meta: true });
+    await openedBehind(3);
+    await api(service, 'POST', '/viewer', { dpr: DPR, mac: false });
+    const middle = [
+      { type: 'pointer', action: 'down', x: 40, y: 32, button: 1, buttons: 4, modifiers: NO_KEYS },
+      { type: 'pointer', action: 'up', x: 40, y: 32, button: 1, buttons: 0, modifiers: NO_KEYS },
+    ];
+    expect((await api(service, 'POST', '/surface/input', { events: middle })).status).toBe(204);
+    await openedBehind(4);
+    // A tab the page opens itself has the page as its opener (a link under Control has none): it would come to the
+    // front, as a plain click's does, unless the service marks the click as one for a tab behind.
+    await click(80, 95, { ...NO_KEYS, ctrl: true });
+    const now = await openedBehind(5);
+    // Back to one tab behind, for the scenarios after this one.
+    for (const tab of now.tabs.filter((each) => each.url === `${site}/b`).slice(1)) await api(service, 'POST', '/tabs', { action: 'close', id: tab.id });
+    await waitFor('two tabs again', () => full(), (s) => s.tabs.length === 2);
+  }, 30_000);
+
+  test('the strip\'s tabs: a new one in front, another shown, one closed', async () => {
+    const before = await full();
+    expect(await (await api(service, 'POST', '/tabs', { action: 'new' })).json()).toEqual({ ok: true });
+    const opened = await waitFor('a new empty tab in front', () => full(), (s) => s.tabs.length === before.tabs.length + 1 && s.url === 'about:blank');
+    const behind = opened.tabs.find((tab) => tab.url === `${site}/b`);
+    expect(await (await api(service, 'POST', '/tabs', { action: 'show', id: behind?.id })).json()).toEqual({ ok: true });
+    await waitFor('the tab behind shown', () => full(), (s) => s.url === `${site}/b` && s.title === 'page b');
+    const empty = opened.tabs.find((tab) => tab.url === 'about:blank');
+    expect(await (await api(service, 'POST', '/tabs', { action: 'close', id: empty?.id })).json()).toEqual({ ok: true });
+    const after = await waitFor('the empty tab gone', () => full(), (s) => s.tabs.length === before.tabs.length);
+    expect(after.url).toBe(`${site}/b`);
+  }, 30_000);
+
+  test('closing the shown tab shows another', async () => {
+    const before = await full();
+    const shown = before.tabs.find((tab) => tab.shown);
+    await api(service, 'POST', '/tabs', { action: 'close', id: shown?.id });
+    const after = await waitFor('another tab shown', () => full(), (s) => s.tabs.length === before.tabs.length - 1 && s.tabs.some((tab) => tab.shown));
+    expect(after.tabs.some((tab) => tab.id === shown?.id)).toBe(false);
+  }, 30_000);
+
+  test('an alert in the shown tab waits for the strip; OK answers it', async () => {
+    await go('/alert', 'alert page');
+    await click(80, 35);
+    const waiting = await waitFor('the alert in the state', () => full(), (s) => s.dialog?.type === 'alert');
+    expect(waiting.dialog?.message).toBe('hello');
+    expect(await (await api(service, 'POST', '/dialog', { accept: true })).json()).toEqual({ ok: true });
+    await waitFor('the page past its alert', () => full(), (s) => s.title === 'after-alert' && s.dialog === null);
+  }, 30_000);
+
+  test('a prompt answered from the strip gives the page the text', async () => {
+    await go('/prompt', 'prompt page');
+    await click(80, 35);
+    await waitFor('the prompt in the state', () => full(), (s) => s.dialog?.type === 'prompt');
+    await api(service, 'POST', '/dialog', { accept: true, text: 'Cloak' });
+    await waitFor('the answer in the page', () => full(), (s) => s.title === 'name:Cloak');
+  }, 30_000);
+
+  let agentTab = '';
+  test('browser.open opens the page in a tab behind and answers its id; the user\'s page stays', async () => {
+    const before = await full();
+    const data = await ok('browser.open', { url: `${site}/agent` });
+    expect(data).toMatchObject({ url: `${site}/agent`, title: 'agent page', opened: true, settled: true, viewport: { mode: 'fill', width: null, height: null } });
+    agentTab = data.tabId;
+    const after = await full();
+    expect(after.url).toBe(before.url);
+    expect(after.tabs.find((tab) => tab.id === agentTab)).toMatchObject({ shown: false, agent: true });
+  }, 60_000);
+
+  test('browser.snapshot: the page\'s text, fields and tabs; without tabId, the chat\'s own tab', async () => {
+    const data = await ok('browser.snapshot');
+    expect(data.url).toBe(`${site}/agent`);
+    expect(data.text).toContain('Agent page');
+    expect(data.elements.find((element: { selector: string }) => element.selector === '#f')).toMatchObject({ tag: 'input', label: 'Name' });
+    expect(data.elements.find((element: { selector: string }) => element.selector === '#s').options.map((option: { label: string }) => option.label)).toEqual(['Alpha', 'Beta']);
+    expect(data.tabs.find((tab: { id: string }) => tab.id === agentTab)).toMatchObject({ active: false });
+    expect(data.tabs.filter((tab: { active: boolean }) => tab.active)).toHaveLength(1);
+  }, 30_000);
+
+  test('browser.type and browser.click are real input: the page sees trusted events', async () => {
+    expect(await ok('browser.type', { selector: '#f', value: 'hello', submit: false })).toMatchObject({ selector: '#f', url: `${site}/agent` });
+    expect((await ok('browser.snapshot', { tabId: agentTab })).title).toBe('value:hello');
+    expect(await ok('browser.click', { text: 'Save' })).toMatchObject({ clicked: '#save', label: 'Save' });
+    expect((await ok('browser.snapshot', { tabId: agentTab })).title).toBe('trusted:true');
+  }, 30_000);
+
+  test('browser.select picks an option by its label; browser.inspect reads computed styles', async () => {
+    expect(await ok('browser.select', { selector: '#s', label: 'Beta' })).toMatchObject({ selector: '#s', label: 'Beta', value: 'b' });
+    expect((await ok('browser.snapshot')).title).toBe('picked:b');
+    expect((await act('browser.select', { selector: '#s', label: 'Gamma' })).ok).toBe(false);
+    const inspected = await ok('browser.inspect', { selector: '#save' });
+    expect(inspected.styles.color).toBe('rgb(255, 0, 0)');
+  }, 30_000);
+
+  test('browser.scroll moves the chat\'s tab and says where it is', async () => {
+    const down = await ok('browser.scroll', { direction: 'down' });
+    expect(down.scrollY).toBeGreaterThan(0);
+    const bottom = await ok('browser.scroll', { direction: 'bottom' });
+    expect(bottom.atBottom).toBe(true);
+    expect((await ok('browser.scroll', { selector: '#end' })).scrolledTo).toBe('#end');
+  }, 30_000);
+
+  test('the agent\'s tab runs as a page in front does: visible, and every capture answers at once', async () => {
+    await waitFor('the page to say how it is seen', () => ok('browser.snapshot', { tabId: agentTab }), (data) => /visibility:\w+/.test(data.text));
+    expect((await ok('browser.snapshot', { tabId: agentTab })).text).toContain('visibility:visible');
+    for (let n = 0; n < 4; n += 1) {
+      const started = Date.now();
+      expect((await ok('browser.capture', { tabId: agentTab })).mime).toBe('image/png');
+      expect(Date.now() - started).toBeLessThan(2000);
+    }
+    expect((await full()).tabs.find((tab) => tab.id === agentTab)?.shown).toBe(false);
+  }, 30_000);
+
+  test('browser.capture answers a PNG of the tab; browser.resize gives it a phone\'s size', async () => {
+    const shot = await ok('browser.capture', { tabId: agentTab });
+    expect(shot.mime).toBe('image/png');
+    expect(Buffer.from(shot.base64, 'base64').subarray(1, 4).toString()).toBe('PNG');
+    expect(shot.width).toBeGreaterThan(100);
+    expect(await ok('browser.resize', { viewport: 'mobile' })).toEqual({ viewport: { mode: 'mobile', width: 390, height: 844 } });
+    const narrow = await ok('browser.capture');
+    expect(narrow.width).toBe(390);
+    await ok('browser.resize', { viewport: 'fill' });
+  }, 30_000);
+
+  test('browser.back and browser.forward move through the chat\'s tab, at once (a page from the back-forward cache too)', async () => {
+    await ok('browser.open', { url: `${site}/a`, tabId: agentTab });
+    let started = Date.now();
+    expect(await ok('browser.back')).toMatchObject({ url: `${site}/agent` });
+    expect(Date.now() - started).toBeLessThan(3000);
+    started = Date.now();
+    expect(await ok('browser.forward')).toMatchObject({ url: `${site}/a`, title: 'page a' });
+    expect(Date.now() - started).toBeLessThan(3000);
+  }, 30_000);
+
+  test('a dialog in the tab the agent works in answers itself', async () => {
+    await ok('browser.open', { url: `${site}/agent`, tabId: agentTab });
+    await ok('browser.click', { selector: '#pop' });
+    await waitFor('the page past its alert', () => ok('browser.snapshot'), (data) => data.title === 'agent-alert-done');
+  }, 30_000);
+
+  test('frames say the agent is working while it acts', async () => {
+    await ok('browser.snapshot');
+    const shown = await frame(service, 0, 0);
+    expect(shown.status).toBe(200);
+    const res = await api(service, 'GET', '/surface/frame?after=0&wait=0');
+    expect(res.headers.get('x-surface-agent-active')).toBe('1');
+  }, 30_000);
+
+  test('an id the service did not issue is refused, never acted on elsewhere', async () => {
+    const answer = await act('browser.snapshot', { tabId: 'not-a-tab' });
+    expect(answer.ok).toBe(false);
+  }, 30_000);
+
+  test('browser.close closes the chat\'s own tab and refuses the user\'s', async () => {
+    const users = (await full()).tabs.find((tab) => !tab.agent);
+    expect((await act('browser.close', { tabId: users?.id })).ok).toBe(false);
+    expect(await ok('browser.close')).toEqual({ closed: true, tabId: agentTab });
+    await waitFor('the agent\'s tab gone', () => full(), (s) => !s.tabs.some((tab) => tab.id === agentTab));
+    expect((await act('browser.close')).ok).toBe(false);
+  }, 30_000);
+});
+
+describe('the browser\'s own keys, while the picture has the focus', () => {
+  let service: Service;
+  let dataDir: string;
+
+  type Full = State & { tabs: Array<{ id: string; url: string; shown: boolean }>; address: { seq: number } | null };
+  const full = async (): Promise<Full> => (await api(service, 'GET', '/state')).json() as Promise<Full>;
+  const shownUrl = (s: Full) => s.tabs.find((tab) => tab.shown)?.url;
+  const go = async (path: string, title?: string) => {
+    expect(await (await api(service, 'POST', '/navigate', { url: `${site}${path}` })).json()).toEqual({ ok: true });
+    return waitFor(`${path} to load`, () => full(), (now) => now.url === `${site}${path}` && !now.loading && (title === undefined || now.title === title));
+  };
+  const send = async (events: unknown[]) => {
+    expect((await api(service, 'POST', '/surface/input', { events })).status).toBe(204);
+  };
+  const press = (key: string, code: string, keyCode: number, modifiers: Partial<typeof NO_KEYS> = {}) => [
+    { type: 'key', action: 'down', key, code, keyCode, modifiers: { ...NO_KEYS, ...modifiers } },
+    { type: 'key', action: 'up', key, code, keyCode, modifiers: { ...NO_KEYS, ...modifiers } },
+  ];
+  /** Keys for text, as a US keyboard sends them. */
+  const typing = (text: string) => Array.from(text).flatMap((char) => {
+    const named: Record<string, [string, number, boolean]> = { '.': ['Period', 190, false], ':': ['Semicolon', 186, true], '/': ['Slash', 191, false] };
+    if (named[char]) return press(char, named[char][0], named[char][1], { shift: named[char][2] });
+    if (/[0-9]/.test(char)) return press(char, `Digit${char}`, 48 + Number(char));
+    return press(char, `Key${char.toUpperCase()}`, char.toUpperCase().charCodeAt(0));
+  });
+  const click = (x: number, y: number, count = 1) => Array.from({ length: count }).flatMap(() => [
+    { type: 'pointer', action: 'down', x, y, button: 0, buttons: 1, modifiers: NO_KEYS },
+    { type: 'pointer', action: 'up', x, y, button: 0, buttons: 0, modifiers: NO_KEYS },
+  ]);
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cloak-test-'));
+    service = await startService(dataDir);
+    await api(service, 'POST', '/viewer', { dpr: 1, mac: false });
+    await api(service, 'POST', '/surface/resize', { width: 900, height: 700 });
+    await waitFor('the browser to run', () => full(), (s) => s.phase === 'running' && s.url === `${site}/`, 60_000);
+  });
+
+  afterAll(async () => {
+    if (service) await stopService(service);
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test('mod+T opens a tab in front; the address typed next opens with Enter', async () => {
+    const before = await full();
+    await send(press('t', 'KeyT', 84, { ctrl: true }));
+    const opened = await waitFor('a new tab in front', () => full(), (s) => s.tabs.length === before.tabs.length + 1 && s.url === 'about:blank');
+    expect(opened.address).not.toBeNull();
+    await send([...typing(`${site.replace('http://', '')}/a`), ...press('Enter', 'Enter', 13)]);
+    await waitFor('the typed address open in it', () => full(), (s) => s.url === `${site}/a` && s.title === 'page a' && s.address === null);
+  }, 30_000);
+
+  test('Ctrl+Tab, mod+digit and OpenChamber\'s own tab keys switch the tabs; mod+W closes one', async () => {
+    const [first, second] = (await full()).tabs;
+    const shows = (url: string, what: string) => waitFor(what, () => full(), (s) => shownUrl(s) === url && s.url === url);
+    await send(press('Tab', 'Tab', 9, { ctrl: true }));
+    await shows(first.url, 'Ctrl+Tab to the first tab');
+    await send(press('Tab', 'Tab', 9, { ctrl: true, shift: true }));
+    await shows(second.url, 'Ctrl+Shift+Tab back to the second');
+    await send(press('1', 'Digit1', 49, { ctrl: true }));
+    await shows(first.url, 'Ctrl+1 to the first');
+    await send(press('9', 'Digit9', 57, { ctrl: true }));
+    await shows(second.url, 'Ctrl+9 to the last');
+    await send(press('ArrowLeft', 'ArrowLeft', 37, { ctrl: true, alt: true }));
+    await shows(first.url, 'OpenChamber\'s previous-tab key to the first');
+    await send(press('ArrowRight', 'ArrowRight', 39, { ctrl: true, alt: true }));
+    await shows(second.url, 'OpenChamber\'s next-tab key to the second');
+    await send(press('w', 'KeyW', 87, { ctrl: true }));
+    const after = await waitFor('the second tab closed', () => full(), (s) => s.tabs.length === 1);
+    expect(after.tabs[0].id).toBe(first.id);
+  }, 30_000);
+
+  test('mod+[ and Alt+← go back, mod+] forward; on a Mac, Command+[ and Command+]', async () => {
+    await go('/a', 'page a');
+    await go('/b', 'page b');
+    await send(press('[', 'BracketLeft', 219, { ctrl: true }));
+    await waitFor('back to /a', () => full(), (s) => s.url === `${site}/a` && !s.loading);
+    await send(press(']', 'BracketRight', 221, { ctrl: true }));
+    await waitFor('forward to /b', () => full(), (s) => s.url === `${site}/b` && !s.loading);
+    await send(press('ArrowLeft', 'ArrowLeft', 37, { alt: true }));
+    await waitFor('Alt+← back to /a', () => full(), (s) => s.url === `${site}/a` && !s.loading);
+    await api(service, 'POST', '/viewer', { dpr: 1, mac: true });
+    await send(press(']', 'BracketRight', 221, { meta: true }));
+    await waitFor('Command+] forward to /b', () => full(), (s) => s.url === `${site}/b` && !s.loading);
+    await api(service, 'POST', '/viewer', { dpr: 1, mac: false });
+  }, 30_000);
+
+  test('mod+L: what is typed before the strip\'s field has the focus goes to the field, not the page', async () => {
+    await go('/form', 'ready');
+    await send(click(170, 35));
+    await send(press('l', 'KeyL', 76, { ctrl: true }));
+    const asked = await waitFor('the address asked for', () => full(), (s) => s.address !== null);
+    await send(typing('ab'));
+    await sleep(300);
+    expect((await full()).title).toBe('ready');
+    expect(await (await api(service, 'POST', '/address', { seq: asked.address?.seq })).json()).toEqual({ ok: true, draft: 'ab' });
+    expect((await full()).address).toBeNull();
+    // Handed over: the page has the keys again.
+    await send(typing('c'));
+    await waitFor('the page to have the next key', () => full(), (s) => s.title === 'value:c');
+  }, 30_000);
+
+  test('a double click on a page just opened is a double click, whatever was clicked on the page before', async () => {
+    const page = await go('/words');
+    const word = JSON.parse(page.title) as { x: number; y: number };
+    await send(click(word.x, word.y));
+    // The same spot on a new document, at once: no run of clicks goes on from the page before. The new document is
+    // the one whose title says so (the same address could still answer with the old one).
+    expect(await (await api(service, 'POST', '/navigate', { url: `${site}/words?again` })).json()).toEqual({ ok: true });
+    await waitFor('the new document', () => full(), (s) => s.title.includes('"at":"?again"'));
+    await send(click(word.x, word.y, 2));
+    expect(await (await api(service, 'GET', '/surface/clipboard')).json()).toEqual({ text: 'beta' });
+  }, 30_000);
 });

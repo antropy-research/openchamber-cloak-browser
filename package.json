@@ -1,6 +1,6 @@
 {
   "name": "@oc-forge/openchamber-cloak-browser",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "CloakBrowser in OpenChamber: a browser on the server that you and the agent share.",
@@ -17,12 +17,15 @@
         "icon": "shield-user",
         "entry": "panel/index.html",
         "dock": "top",
-        "size": 40
+        "size": 72
       },
       "service": {
         "entry": "service/main.js",
         "runtime": "host",
-        "surface": true
+        "surface": true,
+        "provides": [
+          "browser"
+        ]
       }
     }
   },

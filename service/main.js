@@ -120,6 +120,7 @@ var HOST_PUSH_TYPES = new Set([
   "generate-late"
 ]);
 // node_modules/@openchamber/sdk/dist/service-providers.js
+var BROWSER_PROVIDER_PATH = "/browser-control";
 var BROWSER_CONTROL_ACTIONS = [
   "browser.open",
   "browser.snapshot",
@@ -136,6 +137,34 @@ var BROWSER_CONTROL_ACTIONS = [
 ];
 var BROWSER_PROVIDER_IDLE_MS = 10 * 60000;
 var CONTROL_ACTIONS = new Set(BROWSER_CONTROL_ACTIONS);
+var isBrowserControlAction = (value) => CONTROL_ACTIONS.has(value);
+var readContext = (wire) => {
+  const directory = wire?.directory;
+  const sessionId = wire?.sessionId;
+  return {
+    directory: String(directory) === directory && directory.length > 0 ? directory : null,
+    sessionId: String(sessionId) === sessionId && sessionId.length > 0 ? sessionId : null
+  };
+};
+var readBrowserProviderRequest = (body) => {
+  let wire;
+  try {
+    const parsed = JSON.parse(body);
+    if (Object(parsed) !== parsed || parsed === null)
+      return null;
+    wire = parsed;
+  } catch {
+    return null;
+  }
+  const { requestId, action, parameters, context } = wire;
+  if (String(requestId) !== requestId || requestId.length === 0)
+    return null;
+  if (String(action) !== action || !isBrowserControlAction(action))
+    return null;
+  if (Object(parameters) !== parameters)
+    return null;
+  return { requestId, action, parameters, context: readContext(context) };
+};
 var SOURCE_CONTROL_PROVIDER_IDLE_MS = 10 * 60000;
 var NOTIFICATIONS_PROVIDER_IDLE_MS = 10 * 60000;
 var TRACKER_PROVIDER_IDLE_MS = 10 * 60000;
@@ -149,6 +178,7 @@ var SURFACE_SEQ_HEADER = "x-surface-seq";
 var SURFACE_WIDTH_HEADER = "x-surface-width";
 var SURFACE_HEIGHT_HEADER = "x-surface-height";
 var SURFACE_TITLE_HEADER = "x-surface-title";
+var SURFACE_AGENT_ACTIVE_HEADER = "x-surface-agent-active";
 var SURFACE_INPUT_BATCH_MAX = 256;
 var SURFACE_TEXT_MAX = 64000;
 var SURFACE_TITLE_MAX = 200;
@@ -255,9 +285,674 @@ var readSurfaceResizeRequest = (body) => {
     return null;
   return { width: Math.round(width), height: Math.round(height) };
 };
+// service/address.ts
+var toUrl = (input) => {
+  const text = input.trim();
+  if (/^[a-z][a-z0-9+.-]*:/i.test(text) && !/^[^/:]+:\d+(\/|$)/.test(text))
+    return text;
+  if (/^(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:\d+)?(\/|$)/i.test(text))
+    return `http://${text}`;
+  if (!/\s/.test(text) && /^[^/?#]+\.[a-z]{2,}(:\d+)?([/?#]|$)/i.test(text))
+    return `https://${text}`;
+  return `https://www.google.com/search?q=${encodeURIComponent(text)}`;
+};
+
+// service/page-scripts.ts
+var MAX_TEXT_CHARS = 6000;
+var MAX_ELEMENTS = 120;
+var MAX_LABEL_CHARS = 80;
+var MAX_OPTION_COUNT = 32;
+var SCROLL_SETTLE_MAX_MS = 100;
+var HELPERS = `
+  var MAX_ELEMENTS = ${MAX_ELEMENTS};
+  var MAX_LABEL_CHARS = ${MAX_LABEL_CHARS};
+  var MAX_OPTION_COUNT = ${MAX_OPTION_COUNT};
+  var visible = function (element) {
+    var rect = element.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return false;
+    var style = window.getComputedStyle(element);
+    return style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0;
+  };
+  var label = function (element) {
+    var aria = element.getAttribute('aria-label');
+    if (aria) return aria.trim();
+    var value = element.getAttribute('value');
+    var text = (element.innerText || element.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (text) return text.slice(0, MAX_LABEL_CHARS);
+    if (value) return String(value).slice(0, MAX_LABEL_CHARS);
+    var placeholder = element.getAttribute('placeholder');
+    return placeholder ? placeholder.trim().slice(0, MAX_LABEL_CHARS) : '';
+  };
+  var boundedText = function (value) {
+    var text = String(value);
+    if (text.length <= MAX_LABEL_CHARS) return { value: text, truncated: false };
+    var end = MAX_LABEL_CHARS;
+    var last = text.charCodeAt(end - 1);
+    if (last >= 0xD800 && last <= 0xDBFF) end -= 1;
+    return { value: text.slice(0, end), truncated: true };
+  };
+  var selectOptionLabel = function (option) {
+    var explicit = option.getAttribute('label');
+    if (explicit !== null) return explicit;
+    return String(option.textContent || '').replace(/\\s+/g, ' ').trim();
+  };
+  var isOptionDisabled = function (element) {
+    if (element.disabled === true) return true;
+    if (typeof element.matches === 'function' && element.matches(':disabled')) return true;
+    var parent = element.parentElement;
+    while (parent) {
+      if (parent.tagName === 'OPTGROUP' && parent.disabled === true) return true;
+      parent = parent.parentElement;
+    }
+    return false;
+  };
+  var isUnique = function (selector) {
+    try {
+      return document.querySelectorAll(selector).length === 1;
+    } catch (error) {
+      return false;
+    }
+  };
+  var cssPath = function (element) {
+    var tag = element.tagName.toLowerCase();
+    if (element.id) {
+      var byId = '#' + CSS.escape(element.id);
+      if (isUnique(byId)) return byId;
+    }
+    var stableAttrs = ['data-testid', 'data-test-id', 'data-test', 'name', 'aria-label'];
+    for (var a = 0; a < stableAttrs.length; a += 1) {
+      var value = element.getAttribute(stableAttrs[a]);
+      if (!value) continue;
+      var raw = String(value);
+      if (raw.indexOf('"') !== -1) continue;
+      var byAttr = tag + '[' + stableAttrs[a] + '="' + raw + '"]';
+      if (isUnique(byAttr)) return byAttr;
+    }
+    var className = typeof element.className === 'string' ? element.className.trim() : '';
+    if (className) {
+      var classes = className.split(/\\s+/).filter(Boolean);
+      for (var c = 0; c < classes.length; c += 1) {
+        var byClass = tag + '.' + CSS.escape(classes[c]);
+        if (isUnique(byClass)) return byClass;
+      }
+    }
+    var parts = [];
+    var node = element;
+    var depth = 0;
+    while (node && node.nodeType === 1 && depth < 6) {
+      var part = node.tagName.toLowerCase();
+      var parent = node.parentElement;
+      if (!parent) { parts.unshift(part); break; }
+      var siblings = Array.prototype.filter.call(parent.children, function (child) {
+        return child.tagName === node.tagName;
+      });
+      if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
+      parts.unshift(part);
+      if (node.id) { parts[0] = '#' + CSS.escape(node.id); break; }
+      node = parent;
+      depth += 1;
+    }
+    return parts.join(' > ');
+  };
+  var accessibleName = function (element) {
+    var aria = element.getAttribute('aria-label');
+    if (aria && aria.trim()) return aria.trim();
+    var labelled = element.getAttribute('aria-labelledby');
+    if (labelled) {
+      var source = document.getElementById(labelled.split(/\\s+/)[0]);
+      if (source && (source.innerText || '').trim()) return source.innerText.trim();
+    }
+    var title = element.getAttribute('title');
+    if (title && title.trim()) return title.trim();
+    var alt = element.getAttribute('alt');
+    if (alt && alt.trim()) return alt.trim();
+    var text = (element.innerText || element.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (text) return text;
+    var value = element.getAttribute('value');
+    return value && String(value).trim() ? String(value).trim() : '';
+  };
+  var findByText = function (needle) {
+    var wanted = String(needle).replace(/\\s+/g, ' ').trim().toLowerCase();
+    var candidates = document.querySelectorAll('a, button, [role="button"], [role="link"], input[type="submit"], input[type="button"], summary, label');
+    var exact = null;
+    var partial = null;
+    for (var i = 0; i < candidates.length; i += 1) {
+      var element = candidates[i];
+      if (!visible(element)) continue;
+      var text = label(element).toLowerCase();
+      if (!text) continue;
+      if (text === wanted) { exact = element; break; }
+      if (!partial && text.indexOf(wanted) !== -1) partial = element;
+    }
+    return exact || partial;
+  };
+`;
+var wrap = (body) => `(() => {
+${HELPERS}
+${body}
+})()`;
+var snapshotScript = ({ selector } = {}) => wrap(`
+  var scopeSelector = ${JSON.stringify(selector ?? "")};
+  var root = document;
+  if (scopeSelector) {
+    try { root = document.querySelector(scopeSelector); }
+    catch (error) { return { ok: false, error: 'Invalid selector: ' + scopeSelector }; }
+    if (!root) return { ok: false, error: 'No element matches ' + scopeSelector };
+  }
+  var interactive = root.querySelectorAll('a[href], button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [contenteditable="true"]');
+  var elements = [];
+  var visibleTotal = 0;
+  for (var i = 0; i < interactive.length; i += 1) {
+    var element = interactive[i];
+    if (!visible(element)) continue;
+    visibleTotal += 1;
+    if (elements.length >= MAX_ELEMENTS) continue;
+    var rect = element.getBoundingClientRect();
+    var entry = {
+      selector: cssPath(element),
+      tag: element.tagName.toLowerCase(),
+      bounds: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
+    };
+    if (rect.bottom > 0 && rect.top < window.innerHeight) entry.inViewport = true;
+    var type = element.getAttribute('type');
+    if (type) entry.type = type;
+    var role = element.getAttribute('role');
+    if (role) entry.role = role;
+    var labelText = label(element);
+    if (labelText) entry.label = labelText;
+    if (element.disabled === true) entry.disabled = true;
+    if (element.tagName === 'SELECT') {
+      entry.multiple = element.multiple === true;
+      entry.options = [];
+      var optionList = element.options;
+      for (var optionIndex = 0; optionIndex < optionList.length && optionIndex < MAX_OPTION_COUNT; optionIndex += 1) {
+        var option = optionList[optionIndex];
+        var optionLabelText = boundedText(selectOptionLabel(option));
+        var optionValueText = boundedText(option.value);
+        if (optionLabelText.truncated || optionValueText.truncated) entry.optionsTruncated = true;
+        entry.options.push({
+          label: optionLabelText.value,
+          value: optionValueText.value,
+          selected: option.selected === true,
+          disabled: isOptionDisabled(option)
+        });
+      }
+      if (optionList.length > MAX_OPTION_COUNT) entry.optionsTruncated = true;
+    }
+    if (!accessibleName(element)) entry.missingAccessibleName = true;
+    elements.push(entry);
+  }
+  var textRoot = root === document ? document.body : root;
+  var body = textRoot ? (textRoot.innerText || '') : '';
+  var text = body.replace(/\\n{3,}/g, '\\n\\n').trim();
+  var docEl = document.documentElement;
+  var result = {
+    ok: true,
+    url: String(location.href),
+    title: String(document.title || ''),
+    scope: scopeSelector || 'document',
+    scrollY: Math.round(window.scrollY),
+    maxScrollY: Math.max(0, Math.round(docEl.scrollHeight - window.innerHeight)),
+    text: text.slice(0, ${MAX_TEXT_CHARS}),
+    elements: elements
+  };
+  if (text.length > ${MAX_TEXT_CHARS}) {
+    result.textTruncated = true;
+    result.textTotalChars = text.length;
+  }
+  if (visibleTotal > elements.length) {
+    result.elementsTruncated = true;
+    result.interactiveElementsOnPage = visibleTotal;
+  }
+  return result;
+`);
+var locateScript = ({ selector, text }) => wrap(`
+  var selector = ${JSON.stringify(selector ?? "")};
+  var text = ${JSON.stringify(text ?? "")};
+  var target = null;
+  if (selector) {
+    try { target = document.querySelector(selector); }
+    catch (error) { return { ok: false, error: 'Invalid selector: ' + selector }; }
+    if (!target) return { ok: false, error: 'No element matches ' + selector };
+  } else {
+    target = findByText(text);
+    if (!target) return { ok: false, error: 'No clickable element has the label ' + text };
+  }
+  if (target.disabled === true) return { ok: false, error: 'Element is disabled' };
+  target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  var rect = target.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return { ok: false, error: (selector || text) + ' is not visible' };
+  return { ok: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, clicked: cssPath(target), label: label(target), url: String(location.href) };
+`);
+var focusFieldScript = ({ selector }) => wrap(`
+  var selector = ${JSON.stringify(selector)};
+  var target = null;
+  try { target = document.querySelector(selector); }
+  catch (error) { return { ok: false, error: 'Invalid selector: ' + selector }; }
+  if (!target) return { ok: false, error: 'No element matches ' + selector };
+  var editable = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
+  if (!editable) return { ok: false, error: selector + ' is not a text field' };
+  if (target.disabled === true || target.readOnly === true) return { ok: false, error: 'Field is not editable' };
+  target.scrollIntoView({ block: 'center', behavior: 'instant' });
+  target.focus();
+  if (document.activeElement !== target && !target.contains(document.activeElement)) return { ok: false, error: selector + ' did not take the focus' };
+  if (target.isContentEditable) {
+    var range = document.createRange();
+    range.selectNodeContents(target);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } else {
+    try { target.select(); } catch (error) { document.execCommand('selectAll'); }
+  }
+  var empty = target.isContentEditable ? !(target.textContent || '').length : !String(target.value || '').length;
+  return { ok: true, selector: cssPath(target), empty: empty };
+`);
+var selectScript = ({ selector, label: optionLabel, value }) => {
+  const hasLabel = optionLabel !== undefined;
+  const hasValue = value !== undefined;
+  const criterion = hasLabel === hasValue ? "" : hasLabel ? "label" : "value";
+  return wrap(`
+  var selector = ${JSON.stringify(selector)};
+  var criterion = ${JSON.stringify(criterion)};
+  var wanted = ${JSON.stringify(hasLabel ? optionLabel : value)};
+  if (!criterion) return { ok: false, error: 'browser.select requires exactly one of label or value' };
+  var target = null;
+  try { target = document.querySelector(selector); }
+  catch (error) { return { ok: false, error: 'Invalid selector: ' + selector }; }
+  if (!target) return { ok: false, error: 'No element matches ' + selector };
+  if (!(target instanceof window.HTMLSelectElement)) return { ok: false, error: selector + ' is not a native HTML select' };
+  if (isOptionDisabled(target)) return { ok: false, error: 'The select ' + selector + ' is disabled' };
+  if (target.multiple) return { ok: false, error: 'Multiple selects are not supported for browser.select' };
+  var matches = [];
+  for (var i = 0; i < target.options.length; i += 1) {
+    var option = target.options[i];
+    var candidate = criterion === 'label' ? selectOptionLabel(option) : String(option.value);
+    if (candidate === wanted) matches.push(option);
+  }
+  if (matches.length === 0) return { ok: false, error: 'No option in ' + selector + ' has the exact ' + criterion + ' ' + wanted };
+  if (matches.length > 1) return { ok: false, error: 'More than one option in ' + selector + ' has the exact ' + criterion + ' ' + wanted };
+  var match = matches[0];
+  if (isOptionDisabled(match)) return { ok: false, error: 'The matching option in ' + selector + ' is disabled' };
+  target.scrollIntoView({ block: 'center', behavior: 'instant' });
+  for (var j = 0; j < target.options.length; j += 1) target.options[j].selected = target.options[j] === match;
+  var selected = target.selectedOptions;
+  if (selected.length !== 1 || selected[0] !== match || target.value !== match.value) {
+    return { ok: false, error: 'The option in ' + selector + ' could not be selected' };
+  }
+  target.dispatchEvent(new Event('input', { bubbles: true }));
+  target.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: true, selector: cssPath(target), label: selectOptionLabel(match), value: String(target.value), url: String(location.href) };
+`);
+};
+var scrollScript = ({ selector, direction }) => wrap(`
+  var selector = ${JSON.stringify(selector ?? "")};
+  var direction = ${JSON.stringify(direction ?? "")};
+  var settle = function (extra) {
+    return new Promise(function (resolve) {
+      var done = false;
+      var finish = function () {
+        if (done) return;
+        done = true;
+        var doc = document.documentElement;
+        var maxScrollY = Math.max(0, doc.scrollHeight - window.innerHeight);
+        var scrollY = Math.round(window.scrollY);
+        var result = { ok: true, scrollY: scrollY, maxScrollY: Math.round(maxScrollY) };
+        result.atTop = scrollY <= 1;
+        result.atBottom = scrollY >= maxScrollY - 1;
+        for (var key in extra) {
+          if (Object.prototype.hasOwnProperty.call(extra, key)) result[key] = extra[key];
+        }
+        resolve(result);
+      };
+      requestAnimationFrame(function () {
+        requestAnimationFrame(finish);
+      });
+      setTimeout(finish, ${SCROLL_SETTLE_MAX_MS});
+    });
+  };
+  if (selector) {
+    var target = null;
+    try { target = document.querySelector(selector); }
+    catch (error) { return { ok: false, error: 'Invalid selector: ' + selector }; }
+    if (!target) return { ok: false, error: 'No element matches ' + selector };
+    target.scrollIntoView({ block: 'center', behavior: 'instant' });
+    return settle({ scrolledTo: cssPath(target) });
+  }
+  var doc = document.documentElement;
+  var page = Math.round(window.innerHeight * 0.85);
+  var bottom = Math.max(0, doc.scrollHeight - window.innerHeight);
+  if (direction === 'down') window.scrollTo({ top: window.scrollY + page, behavior: 'instant' });
+  else if (direction === 'up') window.scrollTo({ top: window.scrollY - page, behavior: 'instant' });
+  else if (direction === 'top') window.scrollTo({ top: 0, behavior: 'instant' });
+  else if (direction === 'bottom') window.scrollTo({ top: bottom, behavior: 'instant' });
+  else return { ok: false, error: 'Unknown scroll direction: ' + direction };
+  return settle({ direction: direction });
+`);
+var quietScript = ({ quietMs, maxMs }) => wrap(`
+  var quietMs = ${JSON.stringify(quietMs)};
+  var maxMs = ${JSON.stringify(maxMs)};
+  return new Promise(function (resolve) {
+    var startedAt = performance.now();
+    var lastChange = startedAt;
+    var bump = function () { lastChange = performance.now(); };
+    var mutations = new MutationObserver(bump);
+    mutations.observe(document, { subtree: true, childList: true, characterData: true });
+    var resources = null;
+    try {
+      resources = new PerformanceObserver(bump);
+      resources.observe({ type: 'resource' });
+    } catch (error) {
+      resources = null;
+    }
+    var animating = function () {
+      try {
+        if (typeof document.getAnimations !== 'function') return false;
+        var list = document.getAnimations();
+        for (var i = 0; i < list.length; i += 1) {
+          var animation = list[i];
+          if (animation.playState !== 'running' && !animation.pending) continue;
+          if (animation.timeline && animation.timeline !== document.timeline) continue;
+          var timing = animation.effect && animation.effect.getTiming ? animation.effect.getTiming() : null;
+          if (timing && timing.iterations === Infinity) continue;
+          return true;
+        }
+      } catch (error) {
+        return false;
+      }
+      return false;
+    };
+    var check = function () {
+      var now = performance.now();
+      if (animating()) lastChange = now;
+      var quiet = now - lastChange >= quietMs;
+      if (quiet || now - startedAt >= maxMs) {
+        mutations.disconnect();
+        if (resources) resources.disconnect();
+        resolve({ ok: true, quiet: quiet });
+        return;
+      }
+      setTimeout(check, Math.max(16, Math.min(quietMs - (now - lastChange), maxMs - (now - startedAt))));
+    };
+    setTimeout(check, quietMs);
+  });
+`);
+var INSPECTED_STYLE_PROPS = [
+  "color",
+  "background-color",
+  "background-image",
+  "opacity",
+  "font-family",
+  "font-size",
+  "font-weight",
+  "line-height",
+  "letter-spacing",
+  "text-align",
+  "border-radius",
+  "border-width",
+  "border-style",
+  "border-color",
+  "box-shadow",
+  "display",
+  "position",
+  "width",
+  "height",
+  "padding",
+  "margin",
+  "gap",
+  "flex-direction",
+  "justify-content",
+  "align-items",
+  "z-index",
+  "overflow",
+  "visibility"
+];
+var inspectScript = ({ selector }) => wrap(`
+  var selector = ${JSON.stringify(selector)};
+  var target = null;
+  try { target = document.querySelector(selector); }
+  catch (error) { return { ok: false, error: 'Invalid selector: ' + selector }; }
+  if (!target) return { ok: false, error: 'No element matches ' + selector };
+  var computed = window.getComputedStyle(target);
+  var styles = {};
+  var props = ${JSON.stringify(INSPECTED_STYLE_PROPS)};
+  for (var i = 0; i < props.length; i += 1) {
+    var value = computed.getPropertyValue(props[i]);
+    if (value) styles[props[i]] = String(value).trim();
+  }
+  var rect = target.getBoundingClientRect();
+  return {
+    ok: true,
+    selector: cssPath(target),
+    tag: target.tagName.toLowerCase(),
+    label: label(target),
+    bounds: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+    inViewport: rect.bottom > 0 && rect.top < window.innerHeight,
+    styles: styles
+  };
+`);
+
+// service/agent.ts
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var pngSize = (bytes) => ({ width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) });
+
+class Agent {
+  browser;
+  surface;
+  lastTab = new Map;
+  constructor(browser, surface) {
+    this.browser = browser;
+    this.surface = surface;
+  }
+  async handle(request) {
+    this.surface.noteAgent();
+    const since = Date.now();
+    try {
+      const result = await this.run(request);
+      const tabId = this.lastTab.get(this.chat(request));
+      const dialogs = this.browser.raised.filter((each) => each.at >= since && each.tabId === tabId && each.answered);
+      if (!result.ok || dialogs.length === 0)
+        return result;
+      const data = { ...result.data, dialogs: dialogs.map(({ type, message }) => ({ type, message, answer: "ok" })) };
+      return { ...result, data };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      this.surface.noteAgent();
+    }
+  }
+  chat(request) {
+    return request.context.sessionId ?? "";
+  }
+  target(request) {
+    const tabId = request.parameters.tabId;
+    if (tabId !== undefined) {
+      const tab = this.browser.tabs.get(tabId);
+      if (!tab)
+        throw new Error(`There is no tab ${tabId}: name one from the tabs browser.snapshot lists.`);
+      return this.free(tab);
+    }
+    const last = this.lastTab.get(this.chat(request));
+    const tab = (last ? this.browser.tabs.get(last) : undefined) ?? this.browser.shown;
+    if (!tab)
+      throw new Error("No tab is open: open a page with browser.open.");
+    return this.free(tab);
+  }
+  free(tab) {
+    if (!tab.dialog)
+      return tab;
+    const message = tab.dialog.message.length > 200 ? `${tab.dialog.message.slice(0, 200)}…` : tab.dialog.message;
+    throw new Error(`The page in this tab shows a ${tab.dialog.type} dialog ("${message}") and waits for the user to answer it in the Cloak Browser panel. Nothing was changed; ask the user, or work in another tab.`);
+  }
+  worked(request, tab) {
+    this.lastTab.set(this.chat(request), tab.id);
+    this.browser.agentWorking(tab.id);
+  }
+  async script(tab, expression, awaitPromise = false) {
+    const result = await this.browser.evaluate(tab.id, expression, { awaitPromise });
+    if (!result || typeof result !== "object")
+      throw new Error("The page did not answer.");
+    if (result.ok === false)
+      throw new Error(result.error);
+    const { ok: _ok, ...data } = result;
+    return data;
+  }
+  async settle(tab, loaded) {
+    try {
+      const quiet = await this.browser.evaluate(tab.id, quietScript({ quietMs: 500, maxMs: 5000 }), { awaitPromise: true, timeoutMs: 8000 });
+      return loaded && quiet?.quiet === true;
+    } catch {
+      return false;
+    }
+  }
+  async screenshot(session) {
+    const cdp = this.browser.cdp;
+    if (!cdp)
+      throw new Error("The browser is not running.");
+    let failure = null;
+    for (let attempt = 0;attempt < 3; attempt += 1) {
+      try {
+        return await cdp.send("Page.captureScreenshot", { format: "png" }, session, 4000);
+      } catch (error) {
+        failure = error;
+      }
+    }
+    throw new Error(`The tab drew no picture: it is behind the page shown in the panel. Show it there, or open the page with browser.open. (${failure instanceof Error ? failure.message : String(failure)})`);
+  }
+  tabs() {
+    return [...this.browser.tabs.values()].map((tab) => ({ id: tab.id, title: tab.title, url: tab.url, active: tab.id === this.browser.shownId }));
+  }
+  async page(tab) {
+    await this.browser.refresh(tab.id);
+    return { url: tab.url, title: tab.title };
+  }
+  async run(request) {
+    await this.browser.ready();
+    const cdp = this.browser.cdp;
+    if (!cdp)
+      throw new Error("The browser is not running.");
+    switch (request.action) {
+      case "browser.open": {
+        const { url, viewport, tabId } = request.parameters;
+        const tab = tabId !== undefined ? this.target(request) : await this.browser.newTab({ background: true, openedBy: this.chat(request), window: true });
+        this.worked(request, tab);
+        if (viewport)
+          await this.browser.setViewport(tab.id, viewport);
+        const { loaded } = await this.browser.navigate(url, tab.id, 25000);
+        const settled = await this.settle(tab, loaded);
+        const page = await this.page(tab);
+        return { ok: true, data: { tabId: tab.id, url: page.url, title: page.title, opened: true, settled, viewport: this.browser.viewportSummary(tab) } };
+      }
+      case "browser.snapshot": {
+        const tab = this.target(request);
+        this.worked(request, tab);
+        const data = await this.script(tab, snapshotScript({ selector: request.parameters.selector }));
+        return { ok: true, data: { ...data, viewport: this.browser.viewportSummary(tab), tabs: this.tabs() } };
+      }
+      case "browser.click": {
+        const tab = this.target(request);
+        this.worked(request, tab);
+        const found = await this.script(tab, locateScript(request.parameters));
+        const session = await this.browser.sessionOf(tab);
+        const at = { x: found.x, y: found.y };
+        await this.browser.untilDialog(tab, cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...at, button: "none", buttons: 0 }, session));
+        await this.browser.untilDialog(tab, cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", ...at, button: "left", buttons: 1, clickCount: 1 }, session));
+        await this.browser.untilDialog(tab, cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...at, button: "left", buttons: 0, clickCount: 1 }, session));
+        await sleep(300);
+        const page = await this.page(tab);
+        return { ok: true, data: { clicked: found.clicked, label: found.label, url: page.url } };
+      }
+      case "browser.type": {
+        const { selector, value, submit } = request.parameters;
+        const tab = this.target(request);
+        this.worked(request, tab);
+        const field = await this.script(tab, focusFieldScript({ selector }));
+        const session = await this.browser.sessionOf(tab);
+        if (value) {
+          await cdp.send("Input.insertText", { text: value }, session);
+        } else if (!field.empty) {
+          await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 }, session);
+          await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 }, session);
+        }
+        if (submit) {
+          await this.browser.untilDialog(tab, cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r", unmodifiedText: "\r" }, session));
+          await this.browser.untilDialog(tab, cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 }, session));
+          await sleep(300);
+        }
+        const page = await this.page(tab);
+        return { ok: true, data: { selector: field.selector, url: page.url } };
+      }
+      case "browser.select": {
+        const tab = this.target(request);
+        this.worked(request, tab);
+        const data = await this.script(tab, selectScript(request.parameters));
+        return { ok: true, data };
+      }
+      case "browser.scroll": {
+        const tab = this.target(request);
+        this.worked(request, tab);
+        const data = await this.script(tab, scrollScript(request.parameters), true);
+        return { ok: true, data };
+      }
+      case "browser.back":
+      case "browser.forward": {
+        const tab = this.target(request);
+        this.worked(request, tab);
+        const moved = await this.browser.go(request.action === "browser.back" ? "back" : "forward", tab.id, 1e4);
+        if (!moved)
+          return { ok: false, error: request.action === "browser.back" ? "There is no page to go back to in this tab." : "There is no page to go forward to in this tab." };
+        return { ok: true, data: await this.page(tab) };
+      }
+      case "browser.inspect": {
+        const tab = this.target(request);
+        this.worked(request, tab);
+        const data = await this.script(tab, inspectScript(request.parameters));
+        return { ok: true, data };
+      }
+      case "browser.capture": {
+        const tab = this.target(request);
+        this.worked(request, tab);
+        const session = await this.browser.sessionOf(tab);
+        const shot = await this.screenshot(session);
+        const bytes = Buffer.from(shot.data, "base64");
+        const page = await this.page(tab);
+        return { ok: true, data: { base64: shot.data, mime: "image/png", ...pngSize(bytes), url: page.url, title: page.title, viewport: this.browser.viewportSummary(tab) } };
+      }
+      case "browser.resize": {
+        const tab = this.target(request);
+        this.worked(request, tab);
+        await this.browser.setViewport(tab.id, request.parameters.viewport);
+        return { ok: true, data: { viewport: this.browser.viewportSummary(tab) } };
+      }
+      case "browser.close": {
+        const chat = this.chat(request);
+        const tabId = request.parameters.tabId;
+        let tab;
+        if (tabId !== undefined) {
+          tab = this.browser.tabs.get(tabId);
+          if (!tab)
+            return { ok: false, error: `There is no tab ${tabId}: name one from the tabs browser.snapshot lists.` };
+          if (tab.openedBy === null)
+            return { ok: false, error: "That tab is the user's: an agent closes only the tabs it opened." };
+        } else {
+          tab = [...this.browser.tabs.values()].reverse().find((each) => each.openedBy === chat);
+          if (!tab)
+            return { ok: false, error: "This chat has no tab of its own to close." };
+        }
+        await this.browser.closeTab(tab.id);
+        if (this.lastTab.get(chat) === tab.id)
+          this.lastTab.delete(chat);
+        return { ok: true, data: { closed: true, tabId: tab.id } };
+      }
+      default:
+        return { ok: false, error: "Unknown browser action." };
+    }
+  }
+}
+
 // service/browser.ts
 import { spawn as spawn2 } from "node:child_process";
-import { existsSync as existsSync2, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { mkdir as mkdir2, readFile as readFile2, readlink, writeFile as writeFile2 } from "node:fs/promises";
 import { join as join2 } from "node:path";
 
@@ -497,7 +1192,12 @@ class Cdp {
 }
 
 // service/browser.ts
-var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var VIEWPORTS = {
+  mobile: { width: 390, height: 844, mobile: true },
+  tablet: { width: 768, height: 1024, mobile: true },
+  desktop: { width: 1440, height: 900, mobile: false }
+};
+var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var alive = (pid) => {
   try {
     process.kill(pid, 0);
@@ -526,7 +1226,7 @@ var stopLeftover = async (profile) => {
     return;
   process.kill(pid, "SIGKILL");
   for (let wait = 0;wait < 50 && alive(pid); wait += 1)
-    await sleep(100);
+    await sleep2(100);
 };
 
 class Browser {
@@ -536,17 +1236,21 @@ class Browser {
   progress = null;
   binary = null;
   cdp = null;
-  active = null;
   tabs = new Map;
-  loading = false;
+  shownId = null;
+  fillSize = { width: 1280, height: 800 };
   canGoBack = false;
   canGoForward = false;
   child = null;
   starting = null;
   scale = 1;
   launchedScale = 0;
-  activeListeners = new Set;
+  backgroundUntil = 0;
+  shownListeners = new Set;
   eventListeners = new Set;
+  attachWaiters = new Set;
+  dialogListeners = new Set;
+  raised = [];
   lastUrlWrite = null;
   constructor(options) {
     this.options = options;
@@ -556,8 +1260,45 @@ class Browser {
         this.scale = saved.scale;
     } catch {}
   }
+  get profile() {
+    return join2(this.options.dataDir, "profile");
+  }
   get scaleFactor() {
     return this.scale;
+  }
+  get shown() {
+    return this.shownId ? this.tabs.get(this.shownId) ?? null : null;
+  }
+  onShown(listener) {
+    this.shownListeners.add(listener);
+    return () => this.shownListeners.delete(listener);
+  }
+  onCdpEvent(listener) {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+  state() {
+    const tab = this.shown;
+    return {
+      phase: this.phase,
+      error: this.error,
+      progress: this.progress,
+      url: tab?.url ?? "",
+      title: tab?.title ?? "",
+      loading: tab?.loading ?? false,
+      canGoBack: this.canGoBack,
+      canGoForward: this.canGoForward,
+      binary: this.binary ? { version: this.binary.version, source: this.binary.source } : null,
+      tabs: [...this.tabs.values()].map((each) => ({
+        id: each.id,
+        title: each.title,
+        url: each.url,
+        shown: each.id === this.shownId,
+        agent: each.openedBy !== null,
+        loading: each.loading
+      })),
+      dialog: tab?.dialog ?? null
+    };
   }
   async setScale(scale) {
     if (scale === this.scale)
@@ -570,56 +1311,14 @@ class Browser {
       return;
     await this.saveLastUrl();
     await this.stop();
-    this.phase = "idle";
     await this.start().catch(() => {});
   }
-  get profile() {
-    return join2(this.options.dataDir, "profile");
-  }
-  onActive(listener) {
-    this.activeListeners.add(listener);
-    return () => this.activeListeners.delete(listener);
-  }
-  onCdpEvent(listener) {
-    this.eventListeners.add(listener);
-    return () => this.eventListeners.delete(listener);
-  }
-  state() {
-    const tab = this.active ? this.tabs.get(this.active.targetId) : undefined;
-    return {
-      phase: this.phase,
-      error: this.error,
-      progress: this.progress,
-      url: tab?.url ?? "",
-      title: tab?.title ?? "",
-      loading: this.loading,
-      canGoBack: this.canGoBack,
-      canGoForward: this.canGoForward,
-      binary: this.binary ? { version: this.binary.version, source: this.binary.source } : null
-    };
-  }
-  async refresh() {
-    const { cdp, active } = this;
-    if (!cdp || !active)
-      return;
-    try {
-      const back = this.canGoBack;
-      const forward = this.canGoForward;
-      const [{ targetInfo }] = await Promise.all([
-        cdp.send("Target.getTargetInfo", { targetId: active.targetId }, undefined, 2000),
-        this.readHistory()
-      ]);
-      const tab = this.tabs.get(active.targetId);
-      if (tab && tab.title === targetInfo.title && tab.url === targetInfo.url && back === this.canGoBack && forward === this.canGoForward)
-        return;
-      this.tabs.set(active.targetId, { targetId: active.targetId, url: targetInfo.url, title: targetInfo.title, openerId: targetInfo.openerId });
-      this.changed();
-    } catch {}
-  }
   start() {
+    if (this.starting)
+      return this.starting;
     if (this.phase === "running" && this.cdp && !this.cdp.closed)
       return Promise.resolve();
-    this.starting ??= this.launch().finally(() => {
+    this.starting = this.launch().finally(() => {
       this.starting = null;
     });
     return this.starting;
@@ -630,47 +1329,226 @@ class Browser {
     const child = this.child;
     const cdp = this.cdp;
     if (cdp && !cdp.closed) {
-      await Promise.race([cdp.send("Browser.close", {}, undefined, 3000).catch(() => {}), sleep(3000)]);
+      await Promise.race([cdp.send("Browser.close", {}, undefined, 3000).catch(() => {}), sleep2(3000)]);
     }
     cdp?.close();
     if (child && child.exitCode === null && child.signalCode === null) {
       child.kill("SIGTERM");
       for (let wait = 0;wait < 30 && child.exitCode === null && child.signalCode === null; wait += 1)
-        await sleep(100);
+        await sleep2(100);
       if (child.exitCode === null && child.signalCode === null)
         child.kill("SIGKILL");
     }
     this.cdp = null;
-    this.active = null;
     this.tabs.clear();
+    this.shownId = null;
     this.changed();
-  }
-  async navigate(url) {
-    const { cdp, active } = await this.ready();
-    const answer = await cdp.send("Page.navigate", { url }, active.sessionId, 30000);
-    if (answer.errorText && answer.errorText !== "net::ERR_ABORTED")
-      throw new Error(`${url}: ${answer.errorText}`);
-  }
-  async go(direction) {
-    const { cdp, active } = await this.ready();
-    const history = await cdp.send("Page.getNavigationHistory", {}, active.sessionId);
-    const entry = history.entries[history.currentIndex + (direction === "back" ? -1 : 1)];
-    if (entry)
-      await cdp.send("Page.navigateToHistoryEntry", { entryId: entry.id }, active.sessionId);
-  }
-  async reload() {
-    const { cdp, active } = await this.ready();
-    await cdp.send("Page.reload", {}, active.sessionId);
-  }
-  async stopLoading() {
-    const { cdp, active } = await this.ready();
-    await cdp.send("Page.stopLoading", {}, active.sessionId);
   }
   async ready() {
     await this.start();
-    if (!this.cdp || !this.active)
+    if (!this.cdp)
       throw new Error(this.error ?? "The browser is not running.");
-    return { cdp: this.cdp, active: this.active };
+    return this.cdp;
+  }
+  tab(id) {
+    const tab = id ? this.tabs.get(id) : undefined;
+    if (!tab)
+      throw new Error(id ? `There is no tab ${id}.` : "No tab is open.");
+    return tab;
+  }
+  async sessionOf(tab, timeoutMs = 1e4) {
+    const end = Date.now() + timeoutMs;
+    while (!tab.sessionId) {
+      if (!this.tabs.has(tab.id))
+        throw new Error("The tab closed.");
+      if (Date.now() > end)
+        throw new Error("The tab did not open.");
+      await new Promise((resolve) => {
+        const wake = () => {
+          clearTimeout(timer);
+          this.attachWaiters.delete(wake);
+          resolve();
+        };
+        const timer = setTimeout(wake, 200);
+        this.attachWaiters.add(wake);
+      });
+    }
+    if (tab.ready)
+      await tab.ready;
+    if (!tab.sessionId)
+      throw new Error("The tab closed.");
+    return tab.sessionId;
+  }
+  async show(id) {
+    await this.ready();
+    await this.showNow(id);
+  }
+  async showNow(id) {
+    const cdp = this.cdp;
+    if (!cdp)
+      throw new Error("The browser is not running.");
+    const tab = this.tab(id);
+    const session = await this.sessionOf(tab);
+    this.shownId = id;
+    await cdp.send("Page.bringToFront", {}, session).catch(() => {});
+    for (const listener of [...this.shownListeners])
+      listener(tab);
+    await this.readHistory();
+    this.rememberUrl();
+    this.changed();
+  }
+  async newTab(options = {}) {
+    await this.ready();
+    return this.newTabNow(options);
+  }
+  async newTabNow(options) {
+    const cdp = this.cdp;
+    if (!cdp)
+      throw new Error("The browser is not running.");
+    const { targetId } = await cdp.send("Target.createTarget", {
+      url: "about:blank",
+      background: options.background ?? false,
+      ...options.window ? { newWindow: true, width: this.fillSize.width, height: this.fillSize.height } : {}
+    });
+    const end = Date.now() + 1e4;
+    while (!this.tabs.has(targetId) && Date.now() < end)
+      await sleep2(20);
+    const tab = this.tab(targetId);
+    tab.openedBy = options.openedBy ?? null;
+    await this.sessionOf(tab);
+    if (!options.background)
+      await this.showNow(targetId);
+    this.changed();
+    return tab;
+  }
+  async closeTab(id) {
+    const cdp = await this.ready();
+    this.tab(id);
+    await cdp.send("Target.closeTarget", { targetId: id });
+    for (const end = Date.now() + 5000;this.tabs.has(id) && Date.now() < end; )
+      await sleep2(20);
+  }
+  async navigate(url, id, waitMs = 0) {
+    const cdp = await this.ready();
+    const tab = this.tab(id ?? this.shownId);
+    const session = await this.sessionOf(tab);
+    const loaded = waitMs > 0 ? this.nextLoad(session, waitMs) : null;
+    const answer = await cdp.send("Page.navigate", { url }, session, waitMs > 0 ? waitMs : 30000);
+    if (answer.errorText && answer.errorText !== "net::ERR_ABORTED")
+      throw new Error(`${url} did not open: ${answer.errorText}`);
+    return { loaded: loaded ? await loaded : false };
+  }
+  async go(direction, id, waitMs = 0) {
+    const cdp = await this.ready();
+    const tab = this.tab(id ?? this.shownId);
+    const session = await this.sessionOf(tab);
+    const history = await cdp.send("Page.getNavigationHistory", {}, session);
+    const entry = history.entries[history.currentIndex + (direction === "back" ? -1 : 1)];
+    if (!entry)
+      return false;
+    const loaded = waitMs > 0 ? this.nextHistoryStop(tab, session, waitMs) : null;
+    await cdp.send("Page.navigateToHistoryEntry", { entryId: entry.id }, session);
+    if (loaded)
+      await loaded;
+    return true;
+  }
+  async reload(id, ignoreCache = false) {
+    const cdp = await this.ready();
+    await cdp.send("Page.reload", { ignoreCache }, await this.sessionOf(this.tab(id ?? this.shownId)));
+  }
+  async stopLoading(id) {
+    const cdp = await this.ready();
+    await cdp.send("Page.stopLoading", {}, await this.sessionOf(this.tab(id ?? this.shownId)));
+  }
+  async answerDialog(id, accept, text) {
+    const cdp = await this.ready();
+    const tab = this.tab(id);
+    if (!tab.dialog)
+      return;
+    await cdp.send("Page.handleJavaScriptDialog", { accept, ...text !== undefined ? { promptText: text } : {} }, await this.sessionOf(tab));
+    tab.dialog = null;
+    this.changed();
+  }
+  async evaluate(id, expression, options = {}) {
+    const cdp = await this.ready();
+    const session = await this.sessionOf(this.tab(id));
+    const { frameTree } = await cdp.send("Page.getFrameTree", {}, session);
+    const { executionContextId } = await cdp.send("Page.createIsolatedWorld", { frameId: frameTree.frame.id, worldName: "cloak-browser" }, session);
+    const answer = await cdp.send("Runtime.evaluate", { expression, contextId: executionContextId, returnByValue: true, awaitPromise: options.awaitPromise ?? false }, session, options.timeoutMs ?? 15000);
+    if (answer.exceptionDetails)
+      throw new Error(answer.exceptionDetails.exception?.description ?? answer.exceptionDetails.text ?? "The page script failed.");
+    return answer.result?.value;
+  }
+  async setViewport(id, mode) {
+    const tab = this.tab(id);
+    tab.viewport = mode;
+    const size = await this.applyViewport(tab);
+    if (id === this.shownId)
+      for (const listener of [...this.shownListeners])
+        listener(tab);
+    return size;
+  }
+  async applyViewport(tab) {
+    const cdp = this.cdp;
+    const session = tab.sessionId;
+    if (!cdp || !session)
+      throw new Error("The browser is not running.");
+    const preset = tab.viewport === "fill" ? null : VIEWPORTS[tab.viewport];
+    const width = preset?.width ?? this.fillSize.width;
+    const height = preset?.height ?? this.fillSize.height;
+    await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: this.scale, mobile: preset?.mobile ?? false }, session);
+    return { width, height };
+  }
+  viewportSummary(tab) {
+    if (tab.viewport === "fill")
+      return { mode: "fill", width: null, height: null };
+    return { mode: tab.viewport, width: VIEWPORTS[tab.viewport].width, height: VIEWPORTS[tab.viewport].height };
+  }
+  async untilDialog(tab, work) {
+    work.catch(() => {});
+    if (tab.dialog)
+      return;
+    let listener;
+    const opened = new Promise((resolve) => {
+      listener = (each) => {
+        if (each === tab)
+          resolve(undefined);
+      };
+      this.dialogListeners.add(listener);
+    });
+    try {
+      return await Promise.race([work, opened]);
+    } finally {
+      if (listener)
+        this.dialogListeners.delete(listener);
+    }
+  }
+  agentWorking(id, forMs = 8000) {
+    const tab = this.tabs.get(id);
+    if (tab)
+      tab.agentUntil = Date.now() + forMs;
+  }
+  expectBackgroundTab() {
+    this.backgroundUntil = Date.now() + 2000;
+  }
+  async refresh(id = this.shownId) {
+    const cdp = this.cdp;
+    const tab = id ? this.tabs.get(id) : undefined;
+    if (!cdp || !tab)
+      return;
+    try {
+      const back = this.canGoBack;
+      const forward = this.canGoForward;
+      const [{ targetInfo }] = await Promise.all([
+        cdp.send("Target.getTargetInfo", { targetId: tab.id }, undefined, 2000),
+        tab.id === this.shownId ? this.readHistory() : Promise.resolve()
+      ]);
+      if (tab.title === targetInfo.title && tab.url === targetInfo.url && back === this.canGoBack && forward === this.canGoForward)
+        return;
+      tab.title = targetInfo.title;
+      tab.url = targetInfo.url;
+      this.changed();
+    } catch {}
   }
   changed() {
     this.options.onChange();
@@ -702,8 +1580,8 @@ class Browser {
         if (this.cdp !== cdp)
           return;
         this.cdp = null;
-        this.active = null;
         this.tabs.clear();
+        this.shownId = null;
         if (this.phase === "running") {
           this.phase = "failed";
           this.error = "The browser stopped.";
@@ -711,17 +1589,18 @@ class Browser {
         this.changed();
       });
       await cdp.send("Target.setDiscoverTargets", { discover: true });
-      const { targetInfos } = await cdp.send("Target.getTargets");
-      for (const info of targetInfos)
-        if (info.type === "page")
-          this.tabs.set(info.targetId, { targetId: info.targetId, url: info.url, title: info.title, openerId: info.openerId });
-      const first = targetInfos.find((info) => info.type === "page")?.targetId ?? (await cdp.send("Target.createTarget", { url: "about:blank" })).targetId;
-      await this.activate(first);
+      await cdp.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: "page", exclude: false }, { exclude: true }] });
+      const end = Date.now() + 1e4;
+      while (Date.now() < end && ![...this.tabs.values()].some((tab) => tab.sessionId))
+        await sleep2(20);
+      await sleep2(300);
       this.phase = "running";
-      this.changed();
       const last = await this.lastUrl();
-      if (this.tabs.get(first)?.url === "about:blank")
-        this.navigate(last).catch(() => {});
+      const open = [...this.tabs.values()].filter((tab) => tab.sessionId);
+      const first = open.find((tab) => tab.url === last) ?? open.find((tab) => tab.url === "about:blank") ?? open[0] ?? await this.newTabNow({ background: true });
+      await this.showNow(first.id);
+      if (first.url === "about:blank")
+        this.navigate(last, first.id).catch(() => {});
     } catch (error) {
       this.phase = "failed";
       this.error = error instanceof Error ? error.message : String(error);
@@ -789,104 +1668,225 @@ class Browser {
       });
     });
   }
-  async activate(targetId) {
-    const cdp = this.cdp;
-    if (!cdp)
-      return;
-    const previous = this.active;
-    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
-    await cdp.send("Page.enable", {}, sessionId);
-    await cdp.send("Page.bringToFront", {}, sessionId).catch(() => {});
-    this.active = { targetId, sessionId };
-    this.loading = false;
-    if (previous && previous.sessionId !== sessionId) {
-      cdp.send("Target.detachFromTarget", { sessionId: previous.sessionId }).catch(() => {});
-    }
-    for (const listener of [...this.activeListeners])
-      listener(this.active, previous);
-    await this.readHistory();
-    this.changed();
+  nextLoad(session, timeoutMs) {
+    return new Promise((resolve) => {
+      const unsubscribe = this.onCdpEvent((event) => {
+        if (event.method === "Page.loadEventFired" && event.sessionId === session) {
+          clearTimeout(timer);
+          unsubscribe();
+          resolve(true);
+        }
+      });
+      const timer = setTimeout(() => {
+        unsubscribe();
+        resolve(false);
+      }, timeoutMs);
+    });
+  }
+  nextHistoryStop(tab, session, timeoutMs) {
+    return new Promise((resolve) => {
+      const mainFrame = (frameId) => frameId === (tab.mainFrameId ?? tab.id);
+      const unsubscribe = this.onCdpEvent((event) => {
+        if (event.sessionId !== session)
+          return;
+        const frame = event.params.frame;
+        const arrived = event.method === "Page.loadEventFired" || event.method === "Page.frameNavigated" && event.params.type === "BackForwardCacheRestore" && !frame?.parentId || event.method === "Page.navigatedWithinDocument" && mainFrame(event.params.frameId);
+        if (!arrived)
+          return;
+        clearTimeout(timer);
+        unsubscribe();
+        resolve(true);
+      });
+      const timer = setTimeout(() => {
+        unsubscribe();
+        resolve(false);
+      }, timeoutMs);
+    });
   }
   async readHistory() {
-    const { cdp, active } = this;
-    if (!cdp || !active)
+    const cdp = this.cdp;
+    const tab = this.shown;
+    if (!cdp || !tab?.sessionId)
       return;
     try {
-      const history = await cdp.send("Page.getNavigationHistory", {}, active.sessionId);
+      const history = await cdp.send("Page.getNavigationHistory", {}, tab.sessionId);
       this.canGoBack = history.currentIndex > 0;
       this.canGoForward = history.currentIndex < history.entries.length - 1;
     } catch {}
+  }
+  tabBySession(sessionId) {
+    for (const tab of this.tabs.values())
+      if (tab.sessionId === sessionId)
+        return tab;
+    return;
   }
   onEvent(event) {
     if (!event.sessionId) {
       this.onBrowserEvent(event);
       return;
     }
-    if (event.sessionId !== this.active?.sessionId)
+    const tab = this.tabBySession(event.sessionId);
+    if (!tab)
       return;
-    const frame = event.params.frame ?? {};
+    const params = event.params;
     switch (event.method) {
       case "Page.frameStartedLoading":
-      case "Page.frameStoppedLoading":
-      case "Page.loadEventFired": {
+      case "Page.frameStoppedLoading": {
+        if (tab.mainFrameId && params.frameId !== tab.mainFrameId)
+          return;
         const loading = event.method === "Page.frameStartedLoading";
-        if (loading !== this.loading) {
-          this.loading = loading;
+        if (loading !== tab.loading) {
+          tab.loading = loading;
           this.changed();
         }
         if (!loading)
-          this.refresh();
-        break;
+          this.refresh(tab.id);
+        return;
       }
+      case "Page.loadEventFired":
       case "Page.domContentEventFired":
-        this.refresh();
-        break;
-      case "Page.frameNavigated":
+        this.refresh(tab.id);
+        return;
+      case "Page.frameNavigated": {
+        const frame = params.frame;
+        if (frame.parentId)
+          return;
+        tab.mainFrameId = frame.id;
+        tab.url = frame.url;
+        this.refresh(tab.id);
+        if (tab.id === this.shownId)
+          this.rememberUrl();
+        this.changed();
+        return;
+      }
       case "Page.navigatedWithinDocument":
-        if (event.method === "Page.frameNavigated" && frame.parentId)
-          break;
-        this.readHistory().then(() => this.changed());
-        this.refresh();
-        this.rememberUrl();
-        break;
+        if (tab.mainFrameId && params.frameId !== tab.mainFrameId)
+          return;
+        tab.url = String(params.url ?? tab.url);
+        this.refresh(tab.id);
+        if (tab.id === this.shownId)
+          this.rememberUrl();
+        this.changed();
+        return;
+      case "Page.javascriptDialogOpening": {
+        const dialog = { type: String(params.type), message: String(params.message ?? ""), defaultPrompt: String(params.defaultPrompt ?? "") };
+        tab.dialog = dialog;
+        const answered = tab.id !== this.shownId || Date.now() < tab.agentUntil;
+        this.raised.push({ ...dialog, tabId: tab.id, at: Date.now(), answered });
+        if (this.raised.length > 20)
+          this.raised.shift();
+        if (answered)
+          this.answerDialog(tab.id, true, dialog.type === "prompt" ? dialog.defaultPrompt : undefined).catch(() => {});
+        for (const listener of [...this.dialogListeners])
+          listener(tab);
+        this.changed();
+        return;
+      }
+      case "Page.javascriptDialogClosed":
+        tab.dialog = null;
+        this.changed();
+        return;
       default:
-        break;
+        return;
     }
   }
   onBrowserEvent(event) {
-    const info = event.params.targetInfo;
+    const params = event.params;
+    const info = params.targetInfo;
     switch (event.method) {
       case "Target.targetCreated": {
-        if (!info || info.type !== "page")
+        if (!info || info.type !== "page" || this.tabs.has(info.targetId))
           return;
-        this.tabs.set(info.targetId, { targetId: info.targetId, url: info.url, title: info.title, openerId: info.openerId });
-        if (info.openerId && this.active)
-          this.activate(info.targetId).catch(() => {});
+        const opener = info.openerId ? this.tabs.get(info.openerId) : undefined;
+        this.addTab(info);
+        if (opener && opener.id === this.shownId) {
+          const behind = Date.now() < this.backgroundUntil;
+          this.backgroundUntil = 0;
+          if (!behind)
+            this.sessionOf(this.tab(info.targetId)).then(() => this.show(info.targetId)).catch(() => {});
+        }
         this.changed();
         return;
       }
       case "Target.targetInfoChanged": {
-        if (!info || info.type !== "page")
+        const tab = info ? this.tabs.get(info.targetId) : undefined;
+        if (!tab || !info)
           return;
-        this.tabs.set(info.targetId, { targetId: info.targetId, url: info.url, title: info.title, openerId: info.openerId });
-        if (info.targetId === this.active?.targetId)
-          this.changed();
+        tab.url = info.url;
+        tab.title = info.title;
+        this.changed();
         return;
       }
       case "Target.targetDestroyed": {
-        const targetId = event.params.targetId;
+        const targetId = params.targetId;
+        const gone = this.tabs.get(targetId);
+        if (!gone)
+          return;
+        const order = [...this.tabs.keys()];
+        const index = order.indexOf(targetId);
         this.tabs.delete(targetId);
-        if (targetId === this.active?.targetId) {
-          this.active = null;
-          const next = [...this.tabs.keys()].at(-1);
-          (next ? this.activate(next) : this.cdp?.send("Target.createTarget", { url: "about:blank" }).then(({ targetId: created }) => this.activate(created)))?.catch(() => {});
+        if (targetId === this.shownId) {
+          this.shownId = null;
+          const next = (gone.openerId && this.tabs.has(gone.openerId) ? gone.openerId : null) ?? order[index + 1] ?? order[index - 1];
+          if (next && this.tabs.has(next))
+            this.show(next).catch(() => {});
+          else if (this.phase === "running")
+            this.newTab().catch(() => {});
         }
         this.changed();
+        return;
+      }
+      case "Target.attachedToTarget": {
+        const attached = params.targetInfo;
+        if (attached?.type !== "page")
+          return;
+        const tab = this.tabs.get(attached.targetId) ?? this.addTab(attached);
+        tab.sessionId = params.sessionId;
+        tab.ready = this.prepare(tab, params.waitingForDebugger === true);
+        for (const wake of [...this.attachWaiters])
+          wake();
+        return;
+      }
+      case "Target.detachedFromTarget": {
+        const tab = this.tabBySession(params.sessionId);
+        if (tab)
+          tab.sessionId = null;
         return;
       }
       default:
         return;
     }
+  }
+  addTab(info) {
+    const opener = info.openerId ? this.tabs.get(info.openerId) : undefined;
+    const tab = {
+      id: info.targetId,
+      url: info.url,
+      title: info.title,
+      openerId: info.openerId,
+      sessionId: null,
+      ready: null,
+      mainFrameId: null,
+      openedBy: opener?.openedBy ?? null,
+      loading: false,
+      dialog: null,
+      viewport: "fill",
+      agentUntil: 0
+    };
+    this.tabs.set(info.targetId, tab);
+    return tab;
+  }
+  async prepare(tab, paused) {
+    const cdp = this.cdp;
+    const session = tab.sessionId;
+    if (!cdp || !session)
+      return;
+    await Promise.allSettled([
+      cdp.send("Page.enable", {}, session),
+      cdp.send("Emulation.setFocusEmulationEnabled", { enabled: true }, session),
+      this.applyViewport(tab),
+      ...paused ? [cdp.send("Runtime.runIfWaitingForDebugger", {}, session)] : []
+    ]);
   }
   async lastUrl() {
     try {
@@ -905,14 +1905,11 @@ class Browser {
     }, 1000);
   }
   async saveLastUrl() {
-    const url = this.state().url;
+    const url = this.shown?.url ?? "";
     if (!/^https?:\/\//.test(url))
       return;
     await writeFile2(join2(this.options.dataDir, "last.json"), `${JSON.stringify({ url })}
 `).catch(() => {});
-  }
-  get running() {
-    return this.phase === "running" && this.cdp !== null && existsSync2(this.profile);
   }
 }
 
@@ -925,6 +1922,7 @@ var MIN_HEIGHT = 150;
 var MAX_WIDTH = 3840;
 var MAX_HEIGHT = 2400;
 var MULTI_CLICK_MS = 500;
+var TYPING_MS = 1e4;
 var MULTI_CLICK_PX = 5;
 var clamp = (value, min, max) => Math.max(min, Math.min(max, Math.round(value)));
 var jpegSize = (bytes) => {
@@ -1071,13 +2069,18 @@ class Surface {
   waiters = new Set;
   castSession = null;
   casting = Promise.resolve();
-  lastPress = { at: 0, x: 0, y: 0, button: "none", count: 0 };
+  lastPress = { at: 0, x: 0, y: 0, button: "none", count: 0, url: "" };
   shownTitle = "";
   titleReadAt = 0;
+  agentUntil = 0;
+  inputAt = 0;
+  swallowed = new Set;
+  typing = null;
+  typingSeq = 0;
   constructor(browser) {
     this.browser = browser;
     this.dpr = browser.scaleFactor;
-    browser.onActive((active) => this.recast(active));
+    browser.onShown((tab) => this.recast(tab));
     browser.onCdpEvent((event) => this.onCdpEvent(event));
   }
   browserChanged() {
@@ -1095,10 +2098,7 @@ class Surface {
       this.deviceWidth = next.width;
       this.deviceHeight = next.height;
       this.placeholder = null;
-      if (this.browser.active)
-        this.recast(this.browser.active);
-      else
-        this.bump();
+      this.fill();
     }
     return next;
   }
@@ -1108,8 +2108,8 @@ class Surface {
     this.dpr = ratio;
     this.mac = mac;
     this.browser.setScale(ratio);
-    if (changed && this.browser.active)
-      this.recast(this.browser.active);
+    if (changed)
+      this.fill();
   }
   async frameAfter(after, waitMs) {
     this.browser.start().catch(() => {});
@@ -1120,17 +2120,63 @@ class Surface {
       return null;
     const title = this.title();
     this.shownTitle = title;
-    return { frame: this.current(), seq: this.seq, title };
+    return { frame: this.current(), seq: this.seq, title, agentActive: this.agentActive };
   }
   async input(events) {
-    const { cdp, active } = await this.browser.ready();
-    for (const event of events)
-      await this.dispatch(cdp, active.sessionId, event);
+    const cdp = await this.browser.ready();
+    this.inputAt = Date.now();
+    for (const event of events) {
+      const tab = this.browser.tab(this.browser.shownId);
+      if (tab.dialog) {
+        if (event.type === "key" && event.action === "down" && (event.key === "Enter" || event.key === "Escape")) {
+          await this.browser.answerDialog(tab.id, event.key === "Enter", tab.dialog.type === "prompt" ? tab.dialog.defaultPrompt : undefined);
+        }
+        continue;
+      }
+      if (event.type === "key" && await this.shortcut(event))
+        continue;
+      if (this.typeIntoAddress(event))
+        continue;
+      const session = await this.browser.sessionOf(tab);
+      await this.browser.untilDialog(tab, this.dispatch(cdp, session, event));
+    }
+  }
+  stripState() {
+    if (this.typing && Date.now() > this.typing.until)
+      this.typing = null;
+    return { address: this.typing ? { seq: this.typing.seq } : null, inUse: Date.now() - this.inputAt < 3000 };
+  }
+  takeAddress(seq) {
+    if (!this.typing || this.typing.seq !== seq)
+      return null;
+    const { draft } = this.typing;
+    this.typing = null;
+    return draft;
   }
   async clipboard() {
-    const { cdp, active } = await this.browser.ready();
-    const answer = await cdp.send("Runtime.evaluate", { expression: SELECTION_SCRIPT, returnByValue: true }, active.sessionId);
-    return typeof answer.result?.value === "string" ? answer.result.value : "";
+    const shown = this.browser.shown;
+    if (!shown || shown.dialog)
+      return "";
+    const value = await this.browser.evaluate(shown.id, SELECTION_SCRIPT);
+    return typeof value === "string" ? value : "";
+  }
+  noteAgent() {
+    this.agentUntil = Date.now() + 4000;
+  }
+  get agentActive() {
+    return Date.now() < this.agentUntil;
+  }
+  fill() {
+    this.browser.fillSize = { width: Math.max(100, Math.round(this.deviceWidth / this.dpr)), height: Math.max(100, Math.round(this.deviceHeight / this.dpr)) };
+    const shown = this.browser.shown;
+    if (shown)
+      this.recast(shown);
+    else
+      this.bump();
+    for (const tab of this.browser.tabs.values()) {
+      if (tab !== shown && tab.viewport === "fill" && tab.sessionId)
+        this.browser.applyViewport(tab).catch(() => {});
+    }
   }
   current() {
     if (this.frame && this.browser.phase === "running")
@@ -1182,6 +2228,10 @@ class Surface {
     });
   }
   onCdpEvent(event) {
+    if (event.method === "Page.frameNavigated" && event.sessionId && event.sessionId === this.castSession && !event.params.frame?.parentId) {
+      this.lastPress = { at: 0, x: 0, y: 0, button: "none", count: 0, url: "" };
+      return;
+    }
     if (event.method !== "Page.screencastFrame" || !event.sessionId || event.sessionId !== this.castSession)
       return;
     const params = event.params;
@@ -1198,30 +2248,36 @@ class Surface {
     }
     this.bump();
   }
-  recast(active) {
-    this.casting = this.casting.then(() => this.cast(active)).catch((error) => {
+  recast(tab) {
+    this.casting = this.casting.then(() => this.cast(tab)).catch((error) => {
       console.error("[cloak-browser] could not show the tab:", error);
     });
   }
-  async cast(active) {
+  async cast(tab) {
     const cdp = this.browser.cdp;
-    if (!cdp || this.browser.active?.sessionId !== active.sessionId)
+    if (!cdp || this.browser.shownId !== tab.id)
       return;
-    if (this.castSession && this.castSession !== active.sessionId) {
+    const session = await this.browser.sessionOf(tab);
+    if (this.castSession && this.castSession !== session) {
       cdp.send("Page.stopScreencast", {}, this.castSession).catch(() => {});
     }
-    this.cssWidth = Math.max(100, Math.round(this.deviceWidth / this.dpr));
-    this.cssHeight = Math.max(100, Math.round(this.deviceHeight / this.dpr));
-    try {
-      const { windowId } = await cdp.send("Browser.getWindowForTarget", { targetId: active.targetId });
-      await cdp.send("Browser.setWindowBounds", { windowId, bounds: { width: this.cssWidth, height: this.cssHeight } });
-    } catch {}
-    await cdp.send("Emulation.setDeviceMetricsOverride", { width: this.cssWidth, height: this.cssHeight, deviceScaleFactor: this.dpr, mobile: false }, active.sessionId);
-    await cdp.send("Page.stopScreencast", {}, active.sessionId).catch(() => {});
-    this.castSession = active.sessionId;
-    await cdp.send("Page.startScreencast", { format: "jpeg", quality: QUALITY, maxWidth: this.deviceWidth, maxHeight: this.deviceHeight, everyNthFrame: 1 }, active.sessionId);
-    const shot = await cdp.send("Page.captureScreenshot", { format: "jpeg", quality: QUALITY }, active.sessionId).catch(() => null);
-    if (shot && this.castSession === active.sessionId) {
+    this.browser.fillSize = { width: Math.max(100, Math.round(this.deviceWidth / this.dpr)), height: Math.max(100, Math.round(this.deviceHeight / this.dpr)) };
+    if (tab.viewport === "fill") {
+      try {
+        const { windowId } = await cdp.send("Browser.getWindowForTarget", { targetId: tab.id });
+        await cdp.send("Browser.setWindowBounds", { windowId, bounds: { width: this.browser.fillSize.width, height: this.browser.fillSize.height } });
+      } catch {}
+    }
+    const size = await this.browser.applyViewport(tab);
+    this.cssWidth = size.width;
+    this.cssHeight = size.height;
+    await cdp.send("Page.stopScreencast", {}, session).catch(() => {});
+    if (this.castSession !== session)
+      this.lastPress = { at: 0, x: 0, y: 0, button: "none", count: 0, url: "" };
+    this.castSession = session;
+    await cdp.send("Page.startScreencast", { format: "jpeg", quality: QUALITY, maxWidth: this.deviceWidth, maxHeight: this.deviceHeight, everyNthFrame: 1 }, session);
+    const shot = await cdp.send("Page.captureScreenshot", { format: "jpeg", quality: QUALITY }, session, 3000).catch(() => null);
+    if (shot && this.castSession === session) {
       const bytes = Buffer.from(shot.data, "base64");
       const size = jpegSize(bytes);
       if (size) {
@@ -1229,6 +2285,127 @@ class Surface {
         this.bump();
       }
     }
+  }
+  async shortcut(event) {
+    if (event.action === "up")
+      return this.swallowed.delete(event.code);
+    const command = this.browserCommand(event);
+    if (!command)
+      return false;
+    this.swallowed.add(event.code);
+    this.typing = null;
+    try {
+      await command();
+    } catch (error) {
+      console.error("[cloak-browser] a browser key failed:", error);
+    }
+    return true;
+  }
+  browserCommand(event) {
+    const { key, code } = event;
+    const m = event.modifiers;
+    const mac = this.mac;
+    const mod = mac ? m.meta && !m.ctrl : m.ctrl && !m.meta;
+    const letter = key.length === 1 ? key.toLowerCase() : "";
+    const shown = this.browser.shownId;
+    if (mod && !m.alt && !m.shift && letter === "t") {
+      return async () => {
+        await this.browser.newTab();
+        this.typeAddress();
+      };
+    }
+    if (mod && !m.alt && !m.shift && letter === "w")
+      return async () => shown ? this.browser.closeTab(shown) : undefined;
+    if (m.ctrl && !m.meta && !m.alt && key === "Tab")
+      return () => this.cycle(m.shift ? -1 : 1);
+    if (mod && !m.alt && !m.shift && (key === "PageDown" || key === "PageUp"))
+      return () => this.cycle(key === "PageDown" ? 1 : -1);
+    if (mod && m.alt && !m.shift && (key === "ArrowRight" || key === "ArrowLeft"))
+      return () => this.cycle(key === "ArrowRight" ? 1 : -1);
+    if (mac && mod && !m.alt && m.shift && (code === "BracketRight" || code === "BracketLeft"))
+      return () => this.cycle(code === "BracketRight" ? 1 : -1);
+    if (mod && !m.alt && !m.shift && /^Digit[1-9]$/.test(code))
+      return () => this.pick(Number(code.slice(5)));
+    if (mod && !m.alt && !m.shift && (code === "BracketLeft" || code === "BracketRight"))
+      return () => this.history(code === "BracketLeft" ? "back" : "forward");
+    if (!mac && m.alt && !m.ctrl && !m.meta && !m.shift && (key === "ArrowLeft" || key === "ArrowRight"))
+      return () => this.history(key === "ArrowLeft" ? "back" : "forward");
+    if (mod && !m.alt && letter === "r" || key === "F5" && !m.alt && !m.meta)
+      return () => this.browser.reload(shown, m.shift || key === "F5" && m.ctrl);
+    if (mod && !m.alt && !m.shift && letter === "l" || !mac && m.alt && !m.ctrl && !m.meta && !m.shift && letter === "d" || key === "F6" && !m.alt && !m.ctrl && !m.meta && !m.shift) {
+      return async () => this.typeAddress();
+    }
+    return null;
+  }
+  async cycle(step) {
+    const ids = [...this.browser.tabs.keys()];
+    if (ids.length < 2)
+      return;
+    const at = ids.indexOf(this.browser.shownId ?? "");
+    await this.browser.show(ids[(at + step + ids.length) % ids.length]);
+  }
+  async pick(number) {
+    const ids = [...this.browser.tabs.keys()];
+    const id = number === 9 ? ids[ids.length - 1] : ids[number - 1];
+    if (id && id !== this.browser.shownId)
+      await this.browser.show(id);
+  }
+  async history(direction) {
+    await this.browser.go(direction);
+  }
+  typeAddress() {
+    this.typingSeq += 1;
+    this.typing = { seq: this.typingSeq, draft: "", until: Date.now() + TYPING_MS };
+  }
+  typeIntoAddress(event) {
+    const typing = this.typing;
+    if (!typing)
+      return false;
+    if (Date.now() > typing.until) {
+      this.typing = null;
+      return false;
+    }
+    if (event.type === "pointer" && event.action === "move")
+      return false;
+    if (event.type === "text") {
+      typing.draft += event.text;
+      typing.until = Date.now() + TYPING_MS;
+      return true;
+    }
+    if (event.type !== "key") {
+      this.typing = null;
+      return false;
+    }
+    if (event.action === "up")
+      return false;
+    const { key, modifiers: m } = event;
+    if (key === "Shift" || key === "CapsLock" || key === "Alt" || key === "AltGraph" || key === "Process" || key === "Dead")
+      return true;
+    typing.until = Date.now() + TYPING_MS;
+    if (key === "Enter" || key === "Escape") {
+      this.typing = null;
+      this.swallowed.add(event.code);
+      const address = typing.draft.trim();
+      if (key === "Enter" && address)
+        this.browser.navigate(toUrl(address)).catch(() => {});
+      return true;
+    }
+    if (key === "Backspace") {
+      typing.draft = Array.from(typing.draft).slice(0, -1).join("");
+      this.swallowed.add(event.code);
+      return true;
+    }
+    if (Array.from(key).length === 1) {
+      if (m.ctrl || m.meta) {
+        this.typing = null;
+        return false;
+      }
+      typing.draft += key;
+      this.swallowed.add(event.code);
+      return true;
+    }
+    this.typing = null;
+    return false;
   }
   modifiers(modifiers) {
     return (modifiers.alt ? 1 : 0) | (modifiers.ctrl || this.mac && modifiers.meta ? 2 : 0) | (!this.mac && modifiers.meta ? 4 : 0) | (modifiers.shift ? 8 : 0);
@@ -1265,10 +2442,13 @@ class Surface {
     }
     const button = MOUSE_BUTTONS[event.button] ?? "none";
     if (event.action === "down") {
+      if (modifiers & 2 || event.button === 1)
+        this.browser.expectBackgroundTab();
       const now = Date.now();
       const last = this.lastPress;
-      const again = now - last.at < MULTI_CLICK_MS && last.button === button && Math.abs(last.x - x) < MULTI_CLICK_PX && Math.abs(last.y - y) < MULTI_CLICK_PX;
-      this.lastPress = { at: now, x, y, button, count: again ? last.count + 1 : 1 };
+      const url = this.browser.shown?.url ?? "";
+      const again = now - last.at < MULTI_CLICK_MS && last.url === url && last.button === button && Math.abs(last.x - x) < MULTI_CLICK_PX && Math.abs(last.y - y) < MULTI_CLICK_PX;
+      this.lastPress = { at: now, x, y, button, count: again ? last.count + 1 : 1, url };
     }
     await cdp.send("Input.dispatchMouseEvent", {
       type: event.action === "down" ? "mousePressed" : "mouseReleased",
@@ -1337,16 +2517,7 @@ var browser = new Browser({
   onChange: () => surface.browserChanged()
 });
 var surface = new Surface(browser);
-var toUrl = (input) => {
-  const text = input.trim();
-  if (/^[a-z][a-z0-9+.-]*:/i.test(text) && !/^[^/:]+:\d+(\/|$)/.test(text))
-    return text;
-  if (/^(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:\d+)?(\/|$)/i.test(text))
-    return `http://${text}`;
-  if (!/\s/.test(text) && /^[^/?#]+\.[a-z]{2,}(:\d+)?([/?#]|$)/i.test(text))
-    return `https://${text}`;
-  return `https://www.google.com/search?q=${encodeURIComponent(text)}`;
-};
+var agent = new Agent(browser, surface);
 var readBody = (req) => new Promise((resolve, reject) => {
   let body = "";
   req.setEncoding("utf8");
@@ -1389,18 +2560,53 @@ var route = async (req, res) => {
     case "GET /state":
       browser.start().catch(() => {});
       await browser.refresh();
-      return send(res, 200, browser.state());
+      return send(res, 200, { ...browser.state(), ...surface.stripState() });
     case "POST /navigate": {
       const body = await readJson(req);
       const address = typeof body?.url === "string" ? body.url.trim() : "";
       if (!address)
         return send(res, 400, { ok: false, error: "url is required" });
-      return command(res, () => browser.navigate(toUrl(address)));
+      return command(res, async () => {
+        await browser.navigate(toUrl(address));
+      });
     }
     case "POST /history": {
       const body = await readJson(req);
       const direction = body?.direction === "forward" ? "forward" : "back";
-      return command(res, () => browser.go(direction));
+      return command(res, async () => {
+        await browser.go(direction);
+      });
+    }
+    case "POST /tabs": {
+      const body = await readJson(req);
+      const id = typeof body?.id === "string" ? body.id : "";
+      switch (body?.action) {
+        case "new":
+          return command(res, async () => {
+            await browser.newTab();
+          });
+        case "show":
+          return command(res, () => browser.show(id));
+        case "close":
+          return command(res, () => browser.closeTab(id));
+        default:
+          return send(res, 400, { ok: false, error: "action is new, show or close" });
+      }
+    }
+    case "POST /address": {
+      const body = await readJson(req);
+      return send(res, 200, { ok: true, draft: surface.takeAddress(Number(body?.seq)) });
+    }
+    case "POST /dialog": {
+      const body = await readJson(req);
+      const text = typeof body?.text === "string" ? body.text : undefined;
+      return command(res, () => browser.answerDialog(browser.shownId, body?.accept === true, text));
+    }
+    case `POST ${BROWSER_PROVIDER_PATH}`: {
+      const request = readBrowserProviderRequest(await readBody(req));
+      if (!request)
+        return send(res, 400, { ok: false, error: "Not a browser action" });
+      return send(res, 200, await agent.handle(request));
     }
     case "POST /reload":
       return command(res, () => browser.reload());
@@ -1422,7 +2628,8 @@ var route = async (req, res) => {
         [SURFACE_SEQ_HEADER]: String(answer.seq),
         [SURFACE_WIDTH_HEADER]: String(answer.frame.width),
         [SURFACE_HEIGHT_HEADER]: String(answer.frame.height),
-        [SURFACE_TITLE_HEADER]: answer.title
+        [SURFACE_TITLE_HEADER]: answer.title,
+        ...answer.agentActive ? { [SURFACE_AGENT_ACTIVE_HEADER]: "1" } : {}
       });
       res.end(answer.frame.bytes);
       return;

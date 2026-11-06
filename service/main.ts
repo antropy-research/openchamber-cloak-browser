@@ -7,6 +7,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  BROWSER_PROVIDER_PATH,
+  SURFACE_AGENT_ACTIVE_HEADER,
   SURFACE_CLIPBOARD_PATH,
   SURFACE_CONTROL_PATH,
   SURFACE_FRAME_PATH,
@@ -16,11 +18,14 @@ import {
   SURFACE_SEQ_HEADER,
   SURFACE_TITLE_HEADER,
   SURFACE_WIDTH_HEADER,
+  readBrowserProviderRequest,
   readSurfaceControlNotice,
   readSurfaceInputBatch,
   readSurfaceResizeRequest,
 } from '@openchamber/sdk';
 
+import { toUrl } from './address.ts';
+import { Agent } from './agent.ts';
 import { Browser } from './browser.ts';
 import { Surface } from './surface.ts';
 
@@ -39,15 +44,7 @@ const browser = new Browser({
   onChange: () => surface.browserChanged(),
 });
 const surface = new Surface(browser);
-
-/** What the address field holds, as a URL: a scheme kept, a host given https (http for this machine), else a search. */
-const toUrl = (input: string): string => {
-  const text = input.trim();
-  if (/^[a-z][a-z0-9+.-]*:/i.test(text) && !/^[^/:]+:\d+(\/|$)/.test(text)) return text;
-  if (/^(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:\d+)?(\/|$)/i.test(text)) return `http://${text}`;
-  if (!/\s/.test(text) && /^[^/?#]+\.[a-z]{2,}(:\d+)?([/?#]|$)/i.test(text)) return `https://${text}`;
-  return `https://www.google.com/search?q=${encodeURIComponent(text)}`;
-};
+const agent = new Agent(browser, surface);
 
 const readBody = (req: http.IncomingMessage): Promise<string> => new Promise((resolve, reject) => {
   let body = '';
@@ -94,17 +91,54 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
     case 'GET /state':
       void browser.start().catch(() => {});
       await browser.refresh();
-      return send(res, 200, browser.state());
+      return send(res, 200, { ...browser.state(), ...surface.stripState() });
     case 'POST /navigate': {
       const body = await readJson(req);
       const address = typeof body?.url === 'string' ? body.url.trim() : '';
       if (!address) return send(res, 400, { ok: false, error: 'url is required' });
-      return command(res, () => browser.navigate(toUrl(address)));
+      return command(res, async () => {
+        await browser.navigate(toUrl(address));
+      });
     }
     case 'POST /history': {
       const body = await readJson(req);
       const direction = body?.direction === 'forward' ? 'forward' : 'back';
-      return command(res, () => browser.go(direction));
+      return command(res, async () => {
+        await browser.go(direction);
+      });
+    }
+    case 'POST /tabs': {
+      // The strip's tabs: a new one in front, one shown, one closed.
+      const body = await readJson(req);
+      const id = typeof body?.id === 'string' ? body.id : '';
+      switch (body?.action) {
+        case 'new':
+          return command(res, async () => {
+            await browser.newTab();
+          });
+        case 'show':
+          return command(res, () => browser.show(id));
+        case 'close':
+          return command(res, () => browser.closeTab(id));
+        default:
+          return send(res, 400, { ok: false, error: 'action is new, show or close' });
+      }
+    }
+    case 'POST /address': {
+      // The strip's address field took the focus a browser key asked for: it gets what was typed before it did.
+      const body = await readJson(req);
+      return send(res, 200, { ok: true, draft: surface.takeAddress(Number(body?.seq)) });
+    }
+    case 'POST /dialog': {
+      // The shown tab's alert, confirm or prompt, answered from the strip.
+      const body = await readJson(req);
+      const text = typeof body?.text === 'string' ? body.text : undefined;
+      return command(res, () => browser.answerDialog(browser.shownId, body?.accept === true, text));
+    }
+    case `POST ${BROWSER_PROVIDER_PATH}`: {
+      const request = readBrowserProviderRequest(await readBody(req));
+      if (!request) return send(res, 400, { ok: false, error: 'Not a browser action' });
+      return send(res, 200, await agent.handle(request));
     }
     case 'POST /reload':
       return command(res, () => browser.reload());
@@ -126,6 +160,7 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
         [SURFACE_WIDTH_HEADER]: String(answer.frame.width),
         [SURFACE_HEIGHT_HEADER]: String(answer.frame.height),
         [SURFACE_TITLE_HEADER]: answer.title,
+        ...(answer.agentActive ? { [SURFACE_AGENT_ACTIVE_HEADER]: '1' } : {}),
       });
       res.end(answer.frame.bytes);
       return;

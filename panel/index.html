@@ -6,6 +6,25 @@
     <style>
       html, body { margin: 0; height: 100%; overflow: hidden; }
       #root { height: 100%; }
+      .strip { display: flex; flex-direction: column; height: 100%; box-sizing: border-box; font: 12px/1.4 var(--oc-font); color: var(--oc-fg); }
+      .row { display: flex; align-items: center; gap: 2px; padding: 0 8px; box-sizing: border-box; min-width: 0; }
+      .tabs { height: 32px; flex: none; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+      .tabs::-webkit-scrollbar { display: none; }
+      .toolbar { height: 40px; flex: none; }
+      .dialog { height: 38px; flex: none; gap: 8px; border-top: 1px solid color-mix(in srgb, var(--oc-fg) 8%, transparent); }
+      .dialog[hidden] { display: none; }
+      .tab { display: inline-flex; align-items: center; gap: 4px; flex: 0 1 180px; min-width: 64px; max-width: 180px; height: 26px; padding: 0 2px 0 8px; box-sizing: border-box; border-radius: 6px; color: var(--oc-muted); cursor: default; user-select: none; }
+      .tab:hover { background: color-mix(in srgb, var(--oc-fg) 5%, transparent); }
+      .tab[data-shown="true"] { background: color-mix(in srgb, var(--oc-fg) 9%, transparent); color: var(--oc-fg); }
+      .tab .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tab .mark { flex: none; padding: 0 4px; border-radius: 4px; font-size: 10px; line-height: 15px; background: color-mix(in srgb, var(--oc-primary, #3b82f6) 16%, transparent); color: var(--oc-primary-text, var(--oc-fg)); }
+      .tab .close { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; opacity: 0; }
+      .tab:hover .close, .tab[data-shown="true"] .close { opacity: .65; }
+      .tab .close:hover { opacity: 1; background: color-mix(in srgb, var(--oc-fg) 10%, transparent); }
+      .new-tab { flex: none; }
+      .status { flex: none; max-width: 40%; margin-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--oc-muted); }
+      .status[data-error="true"] { color: var(--oc-error-text, var(--oc-error)); }
+      .message { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     </style>
   </head>
   <body>
