@@ -28,6 +28,7 @@ import {
 import { toUrl } from './address.ts';
 import { Agent } from './agent.ts';
 import { Browser } from './browser.ts';
+import { Mirror } from './mirror.ts';
 import { Surface } from './surface.ts';
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
@@ -46,6 +47,7 @@ const browser = new Browser({
 });
 const surface = new Surface(browser);
 const agent = new Agent(browser, surface);
+const mirror = new Mirror(browser);
 
 const readBody = (req: http.IncomingMessage): Promise<string> => new Promise((resolve, reject) => {
   let body = '';
@@ -125,6 +127,32 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
         default:
           return send(res, 400, { ok: false, error: 'action is new, show or close' });
       }
+    }
+    case 'GET /mirror/events': {
+      // The page as HTML for the panel: everything after `after`, waiting up to `wait` ms for news.
+      const after = Number(url.searchParams.get('after')) || 0;
+      const wait = Number(url.searchParams.get('wait')) || 0;
+      return send(res, 200, await mirror.events(after, wait, url.searchParams.get('run') ?? ''));
+    }
+    case 'POST /mirror/wake':
+      // A view lost its place: the requests waiting for news are answered now, and it asks for the page again.
+      mirror.wake();
+      return send(res, 200, { ok: true });
+    case 'POST /mirror/resources': {
+      const body = await readJson(req);
+      const urls = Array.isArray(body?.urls) ? body.urls.filter((value): value is string => typeof value === 'string' && /^https?:/i.test(value)).slice(0, 200) : [];
+      return send(res, 200, await mirror.resources(urls));
+    }
+    case 'POST /mirror/view': {
+      // The panel's page area, in device pixels, its pixel ratio and whether it is a Mac: the shown page is laid out
+      // at that size, as the picture was at the size OpenChamber sent (surface.ts, resize).
+      const body = await readJson(req);
+      const width = Number(body?.width);
+      const height = Number(body?.height);
+      const dpr = typeof body?.dpr === 'number' && Number.isFinite(body.dpr) ? body.dpr : 1;
+      if (!(width > 0 && height > 0)) return send(res, 400, { ok: false, error: 'width and height are required' });
+      surface.viewer(dpr, body?.mac === true);
+      return send(res, 200, { ok: true, ...surface.resize(width, height) });
     }
     case 'POST /address': {
       // The strip's address field took the focus a browser key asked for: it gets what was typed before it did.

@@ -21,6 +21,8 @@ const MULTI_CLICK_MS = 500;
 /** How long the address keeps what is typed for it without a key, waiting for the strip's field. */
 const TYPING_MS = 10_000;
 const MULTI_CLICK_PX = 5;
+/** The picture is drawn for a viewer that asked for one this recently. */
+const PICTURE_IDLE_MS = 30_000;
 
 type Frame = { bytes: Buffer; width: number; height: number; mime: 'image/jpeg' | 'image/png' };
 type Modifiers = { alt: boolean; ctrl: boolean; meta: boolean; shift: boolean };
@@ -178,6 +180,11 @@ export class Surface {
    * strip, which sees this, makes the panel tell it again (panel/main.ts, checkSize).
    */
   private sized = false;
+  /**
+   * When a viewer last asked for a picture. The page in the panel is HTML (mirror.ts); the screencast runs only while
+   * something draws the picture, and stops at its first frame after nobody has for PICTURE_IDLE_MS.
+   */
+  private pictureAt = 0;
 
   constructor(private readonly browser: Browser) {
     this.dpr = browser.scaleFactor;
@@ -231,6 +238,9 @@ export class Surface {
   /** `GET /surface/frame?after=<seq>&wait=<ms>`: the picture once it is newer than `after`, else null (204). */
   async frameAfter(after: number, waitMs: number): Promise<{ frame: Frame; seq: number; title: string; agentActive: boolean } | null> {
     void this.browser.start().catch(() => {});
+    const watched = this.pictureWatched;
+    this.pictureAt = Date.now();
+    if (!watched && this.browser.shown) this.recast(this.browser.shown);
     const wait = clamp(waitMs, 0, FRAME_WAIT_MAX_MS);
     if (this.seq <= after && wait > 0) await this.next(wait);
     if (this.seq <= after) return null;
@@ -296,6 +306,10 @@ export class Surface {
 
   get agentActive(): boolean {
     return Date.now() < this.agentUntil;
+  }
+
+  private get pictureWatched(): boolean {
+    return Date.now() - this.pictureAt < PICTURE_IDLE_MS;
   }
 
   /**
@@ -368,6 +382,10 @@ export class Surface {
       return;
     }
     if (event.method !== 'Page.screencastFrame' || !event.sessionId || event.sessionId !== this.castSession) return;
+    if (!this.pictureWatched) {
+      void this.browser.cdp?.send('Page.stopScreencast', {}, event.sessionId).catch(() => {});
+      return;
+    }
     const params = event.params as { data: string; sessionId: number };
     void this.browser.cdp?.send('Page.screencastFrameAck', { sessionId: params.sessionId }, event.sessionId).catch(() => {});
     const bytes = Buffer.from(params.data, 'base64');
@@ -412,6 +430,8 @@ export class Surface {
     await cdp.send('Page.stopScreencast', {}, session).catch(() => {});
     if (this.castSession !== session) this.lastPress = { at: 0, x: 0, y: 0, button: 'none', count: 0, url: '' };
     this.castSession = session;
+    // Nothing draws the picture: the page has its size, which is all the mirror needs.
+    if (!this.pictureWatched) return;
     await cdp.send('Page.startScreencast', { format: 'jpeg', quality: QUALITY, maxWidth: this.deviceWidth, maxHeight: this.deviceHeight, everyNthFrame: 1 }, session);
     // A page that is not painting sends no frame: take one, so a new tab or size shows at once.
     // Not long: a page held by a dialog may paint nothing until it is answered, and the next tab waits behind this.

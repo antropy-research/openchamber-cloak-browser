@@ -1,10 +1,10 @@
-// The strip OpenChamber docks above the picture (`panel.dock: "top"`): the tabs, then back, forward, reload, the
-// address and what the browser is doing, and a row for a page's alert, confirm or prompt when one waits. An ordinary
-// panel page: it reaches the service through `host.serviceRequest` and never sees the picture or the input, which
-// stay with the host. It also tells the service this window's pixel ratio, so the picture is drawn for the screen it
-// is shown on.
+// The panel: a strip with the tabs, then back, forward, reload, the address and what the browser is doing; under it
+// the shown tab's page as HTML (mirror-view.ts), with a page's alert, confirm or prompt over it when one waits. It
+// reaches the service through `host.serviceRequest` only.
 import { connectHost } from '@openchamber/sdk';
 import { applyHostReady, mountButton, mountTextField } from '@openchamber/sdk/ui';
+
+import { MirrorView } from './mirror-view.ts';
 
 type Tab = { id: string; title: string; url: string; shown: boolean; agent: boolean; loading: boolean };
 type Dialog = { type: string; message: string; defaultPrompt: string };
@@ -19,19 +19,11 @@ type State = {
   canGoForward: boolean;
   tabs: Tab[];
   dialog: Dialog | null;
-  /** A browser key in the picture asked for the address (mod+L, mod+T): the field takes the focus. */
+  /** A browser key in the page asked for the address (mod+L, mod+T): the field takes the focus. */
   address: { seq: number } | null;
-  /** The user is working in the picture: the strip looks more often, so a new tab or title shows at once. */
+  /** The user is working in the page: the strip looks more often, so a new tab or title shows at once. */
   inUse: boolean;
-  /** The picture's size in device pixels, and whether a panel has told this service run its size. */
-  surface?: { width: number; height: number; maxWidth: number; sized: boolean };
-  /** This window holds the picture (it took control). */
-  youControl?: boolean;
 };
-
-/** The dock's thickness (manifest `panel.size`), and with the dialog row. */
-const HEIGHT = 72;
-const HEIGHT_WITH_DIALOG = 110;
 
 // Remixicon (Apache-2.0) line icons, 24×24.
 const ICONS = {
@@ -67,25 +59,28 @@ tabsRow.className = 'row tabs';
 tabsRow.setAttribute('role', 'tablist');
 const toolbar = document.createElement('div');
 toolbar.className = 'row toolbar';
-const dialogRow = document.createElement('div');
-dialogRow.className = 'row dialog';
-dialogRow.hidden = true;
-strip.append(tabsRow, toolbar, dialogRow);
+strip.append(tabsRow, toolbar);
 root.append(strip);
 
-/**
- * Hands the keyboard back to OpenChamber's window once the strip is done with it. When focus returns to the window
- * from a frame, OpenChamber 2.6 puts the caret in the chat box unless the focused element takes text, and the
- * picture's element is not one of those (`refocusAfterWindowFocus` in its inputRedirect.ts). So a click on the
- * picture right after using the strip would lose the keyboard to the chat box. Returning focus now spends that event
- * here, and the click on the picture keeps it.
- */
+const placeholder = document.createElement('div');
+placeholder.className = 'placeholder';
+let pageShown = false;
+const view = new MirrorView(root, {
+  host,
+  onShown: (shown) => {
+    pageShown = shown;
+    if (state) paintPlaceholder(state);
+  },
+});
+const dialogBox = document.createElement('div');
+dialogBox.className = 'dialog';
+dialogBox.setAttribute('role', 'alertdialog');
+dialogBox.hidden = true;
+view.element.append(placeholder, dialogBox);
+
+/** The keyboard to the page once the strip is done with it, as in a browser after Enter in the address field. */
 const releaseFocus = (): void => {
-  try {
-    window.parent.focus();
-  } catch {
-    // not allowed here: the first click on the picture may then land in the chat box, the second one holds
-  }
+  view.focus();
 };
 
 /** An icon button in the SDK's ghost style: mountButton draws it, the icon goes where its label is empty. */
@@ -235,11 +230,11 @@ const external = iconButton(toolbar, 'Open in your browser', ICONS.external, () 
   if (/^https?:\/\//.test(url)) void host.openUrl(url).catch(() => {});
 });
 
-// The dialog row.
-const dialogMessage = document.createElement('span');
+// The dialog, over the page as in a browser: it does not change the page's size.
+const dialogMessage = document.createElement('div');
 dialogMessage.className = 'message';
 const promptBox = document.createElement('div');
-promptBox.style.cssText = 'flex:0 1 40%;min-width:0;';
+promptBox.className = 'prompt';
 let promptText = '';
 const promptField = mountTextField(promptBox, {
   value: '',
@@ -257,78 +252,20 @@ promptBox.querySelector('input')?.addEventListener('keydown', (event) => {
   event.preventDefault();
   answer(event.key === 'Enter');
 });
-dialogRow.append(dialogMessage, promptBox);
-mountButton(dialogRow, { label: 'OK', variant: 'default', size: 'xs', onClick: () => answer(true) });
-mountButton(dialogRow, { label: 'Cancel', variant: 'ghost', size: 'xs', onClick: () => answer(false) });
-const cancelNode = dialogRow.lastElementChild as HTMLButtonElement;
-
-/** The strip's height as it should be now: with the dialog row or without. */
-let baseHeight = HEIGHT;
-
-/**
- * Makes OpenChamber tell the service the panel's size again. OpenChamber sends it only when the picture's box changes
- * size, over an open connection, so a service started again (a restart of OpenChamber, an update) or a connection
- * that opened late gets none, and the page is laid out at another size and scaled into the panel. A pixel more of
- * strip and back changes the box twice; OpenChamber then sends the size it settles at, which is the panel's.
- */
-let nudging = false;
-let lastNudgeAt = 0;
-const nudgeSize = async (): Promise<void> => {
-  if (nudging) return;
-  nudging = true;
-  lastNudgeAt = Date.now();
-  try {
-    await host.setHeight(baseHeight + 1);
-    // Past the dock's 200 ms transition, so the box really changed before it changes back.
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await host.setHeight(baseHeight);
-  } catch {
-    // an older OpenChamber: the next look tries again
-  } finally {
-    nudging = false;
-  }
-};
-
-/**
- * Whether the picture has this window's size, and the nudge when it has not: while no panel has given the service
- * its size since it started (again and again, slower each time: the picture may wait for "Try again"), once after the
- * strip loads when the width differs, and once each time this window takes control with another width (two windows
- * at different sizes do not then take turns forever). The strip is as wide as the picture.
- */
-const SIZE_SLACK = 2;
-const UNSIZED_WAITS_MS = [2000, 2000, 4000, 8000, 15_000];
-let unsizedNudges = 0;
-let checkedSince = false;
-let controlled = false;
-const checkSize = (next: State): void => {
-  const surface = next.surface;
-  if (!surface || next.phase !== 'running') return;
-  const wanted = Math.min(surface.maxWidth, Math.round(window.innerWidth * (window.devicePixelRatio || 1)));
-  const off = Math.abs(surface.width - wanted) > SIZE_SLACK;
-  const takesControl = next.youControl === true && !controlled;
-  controlled = next.youControl === true;
-  const now = Date.now();
-  if (!surface.sized) {
-    if (now - lastNudgeAt > UNSIZED_WAITS_MS[Math.min(unsizedNudges, UNSIZED_WAITS_MS.length - 1)]) {
-      unsizedNudges += 1;
-      void nudgeSize();
-    }
-    return;
-  }
-  unsizedNudges = 0;
-  const firstLook = !checkedSince;
-  checkedSince = true;
-  if (off && (firstLook || takesControl)) void nudgeSize();
-};
+const dialogButtons = document.createElement('div');
+dialogButtons.className = 'buttons';
+mountButton(dialogButtons, { label: 'Cancel', variant: 'ghost', size: 'xs', onClick: () => answer(false) });
+const cancelNode = dialogButtons.lastElementChild as HTMLButtonElement;
+mountButton(dialogButtons, { label: 'OK', variant: 'default', size: 'xs', onClick: () => answer(true) });
+const okNode = dialogButtons.lastElementChild as HTMLButtonElement;
+dialogBox.append(dialogMessage, promptBox, dialogButtons);
 
 let shownDialog = '';
 const paintDialog = (dialog: Dialog | null): void => {
   const key = JSON.stringify(dialog);
   if (key === shownDialog) return;
   shownDialog = key;
-  dialogRow.hidden = !dialog;
-  baseHeight = dialog ? HEIGHT_WITH_DIALOG : HEIGHT;
-  void host.setHeight(baseHeight).catch(() => {});
+  dialogBox.hidden = !dialog;
   if (!dialog) return;
   const kind = dialog.type === 'beforeunload' ? 'Leave this page?' : dialog.message;
   dialogMessage.textContent = kind;
@@ -338,6 +275,24 @@ const paintDialog = (dialog: Dialog | null): void => {
   promptField.update({ value: dialog.defaultPrompt });
   // Not `hidden`: the SDK's button sets its own display, which wins over the attribute.
   cancelNode.style.display = dialog.type === 'alert' ? 'none' : '';
+  // The keyboard answers it, as in a browser: Enter is OK, Escape is Cancel (the prompt's field has its own).
+  const field = promptBox.querySelector('input');
+  if (dialog.type === 'prompt' && field) field.focus();
+  else okNode.focus();
+};
+dialogBox.addEventListener('keydown', (event) => {
+  if (event.target instanceof HTMLInputElement) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    answer(false);
+  }
+});
+
+/** Over the page while it has none to show: what the browser is doing, or why it stopped. */
+const paintPlaceholder = (next: State): void => {
+  const showing = pageShown && next.phase === 'running';
+  placeholder.hidden = showing;
+  if (!showing) placeholder.textContent = describe(next) || 'Cloak Browser';
 };
 
 let shownError: string | null = null;
@@ -372,7 +327,7 @@ const describe = (next: State): string => {
 };
 
 /**
- * The field takes the focus a browser key in the picture asked for, and what was typed before it did: the service
+ * The field takes the focus a browser key in the page asked for, and what was typed before it did: the service
  * kept those keys from the page and hands them over here, so nothing typed right after mod+L is lost.
  */
 let takenAddress = 0;
@@ -398,7 +353,7 @@ const takeAddress = async (seq: number): Promise<void> => {
 
 const paint = (next: State): void => {
   state = next;
-  checkSize(next);
+  paintPlaceholder(next);
   if (next.address && next.address.seq !== takenAddress) void takeAddress(next.address.seq);
   paintTabs(next.tabs ?? []);
   paintDialog(next.dialog ?? null);
@@ -430,28 +385,14 @@ const refresh = async (): Promise<void> => {
   }
 };
 
-const tellViewer = (): void => {
-  const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-  void host.serviceRequest({ method: 'POST', path: '/viewer', body: JSON.stringify({ dpr: window.devicePixelRatio || 1, mac }) }).catch(() => {});
-};
-
-const watchRatio = (): void => {
-  const query = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
-  query.addEventListener('change', () => {
-    tellViewer();
-    watchRatio();
-  }, { once: true });
-};
-
 let started = false;
 host.onReady((context) => {
   applyHostReady(context, document.documentElement);
   if (started) return;
   started = true;
-  tellViewer();
-  watchRatio();
+  view.start();
   void refresh();
-  // Fast while the user works in the picture or something is moving (a download, a load), slow while the page
+  // Fast while the user works in the page or something is moving (a download, a load), slow while the page
   // sits still.
   const tick = (): void => {
     const moving = !state || state.phase !== 'running' || state.loading;

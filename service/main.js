@@ -1932,6 +1932,771 @@ class Browser {
   }
 }
 
+// service/mirror.ts
+import { randomUUID } from "node:crypto";
+
+// service/mirror-recorder.ts
+function mirrorRecorder() {
+  const world = window;
+  if (world.__cloakMirror)
+    return;
+  const HTML = "http://www.w3.org/1999/xhtml";
+  const SVG = "http://www.w3.org/2000/svg";
+  const MATH = "http://www.w3.org/1998/Math/MathML";
+  const SKIP = new Set(["script", "noscript", "template", "base", "meta"]);
+  const PATCH = new Set(["canvas", "video", "iframe", "embed", "object", "audio"]);
+  const URL_ATTRIBUTES = new Set(["src", "href", "poster", "action", "formaction", "data", "background", "cite", "xlink:href"]);
+  const ids = new WeakMap;
+  const byId = new Map;
+  const sent = new WeakSet;
+  const detached = new WeakSet;
+  const styles = new Map;
+  const controls = new Map;
+  let nextId = 1;
+  let queue = [];
+  let running = false;
+  let adopted = "";
+  const idOf = (node) => {
+    let id = ids.get(node);
+    if (!id) {
+      id = nextId++;
+      ids.set(node, id);
+    }
+    byId.set(id, new WeakRef(node));
+    return id;
+  };
+  const absolute = (value, base = document.baseURI) => {
+    try {
+      return new URL(value, base).href;
+    } catch {
+      return value;
+    }
+  };
+  const cssUrls = (css, base) => css.replace(/url\(\s*(['"]?)([^'")]*)\1\s*\)/g, (match, _quote, url) => {
+    if (!url || /^(data:|blob:|#|about:)/i.test(url))
+      return match;
+    return `url("${absolute(url, base)}")`;
+  });
+  const sheetText = (sheet, base) => {
+    if (!sheet)
+      return null;
+    let rules;
+    try {
+      rules = sheet.cssRules;
+    } catch {
+      return null;
+    }
+    const parts = [];
+    for (let index = 0;index < rules.length; index += 1) {
+      const rule = rules[index];
+      if (rule instanceof CSSImportRule) {
+        const inner = sheetText(rule.styleSheet, rule.styleSheet?.href ?? base);
+        parts.push(inner ?? `@import url("${absolute(rule.href, base)}");`);
+        continue;
+      }
+      parts.push(rule.cssText);
+    }
+    return cssUrls(parts.join(`
+`), base);
+  };
+  const adoptedText = (sheets) => sheets.map((sheet) => sheetText(sheet, document.baseURI) ?? "").join(`
+`);
+  const isStylesheet = (element) => /(^|\s)stylesheet(\s|$)/i.test(element.getAttribute("rel") ?? "");
+  const attributesOf = (element) => {
+    const out = {};
+    for (const attribute of Array.from(element.attributes)) {
+      const name = attribute.name;
+      if (/^on/i.test(name))
+        continue;
+      let value = attribute.value;
+      if (URL_ATTRIBUTES.has(name) && value && !/^(javascript:|data:|blob:|#)/i.test(value))
+        value = absolute(value);
+      else if (name === "style")
+        value = cssUrls(value, document.baseURI);
+      out[name] = value;
+    }
+    return out;
+  };
+  const formState = (element) => {
+    if (element instanceof HTMLInputElement) {
+      if (element.type === "file")
+        return null;
+      return JSON.stringify({ v: element.value, k: element.checked });
+    }
+    if (element instanceof HTMLTextAreaElement)
+      return JSON.stringify({ v: element.value });
+    if (element instanceof HTMLSelectElement)
+      return JSON.stringify({ v: element.value, si: element.selectedIndex });
+    return null;
+  };
+  const ignored = (node) => {
+    if (node.nodeType === Node.TEXT_NODE)
+      return false;
+    if (node.nodeType !== Node.ELEMENT_NODE)
+      return true;
+    const element = node;
+    if (element.localName.toLowerCase() === "script" || element.namespaceURI === HTML && SKIP.has(element.localName))
+      return true;
+    return element.namespaceURI === HTML && element.localName === "link" && !isStylesheet(element);
+  };
+  let observer;
+  const observedShadows = new WeakSet;
+  const serialize = (node, parentNs) => {
+    if (ignored(node))
+      return null;
+    const id = idOf(node);
+    sent.add(node);
+    detached.delete(node);
+    if (node.nodeType === Node.TEXT_NODE)
+      return { i: id, x: node.data };
+    const element = node;
+    const tag = element.localName;
+    const out = { i: id, n: tag };
+    const ns = element.namespaceURI === SVG ? "s" : element.namespaceURI === MATH ? "m" : null;
+    if (ns !== parentNs)
+      out.ns = ns ?? "h";
+    const attributes = attributesOf(element);
+    if (element.namespaceURI === HTML) {
+      if (tag === "style") {
+        out.a = attributes;
+        out.css = sheetText(element.sheet, document.baseURI) ?? element.textContent ?? "";
+        styles.set(id, { node: new WeakRef(element), rules: element.sheet?.cssRules.length ?? 0 });
+        return out;
+      }
+      if (tag === "link") {
+        const link = element;
+        out.a = { rel: "stylesheet", href: link.href, ...link.media ? { media: link.media } : {} };
+        return out;
+      }
+      if (tag === "img") {
+        const image = element;
+        const chosen = image.currentSrc || image.getAttribute("src") || "";
+        delete attributes.srcset;
+        delete attributes.sizes;
+        if (chosen)
+          attributes.src = absolute(chosen);
+      }
+      if (tag === "source" && element.parentElement?.localName === "picture") {
+        delete attributes.srcset;
+      }
+      if (PATCH.has(tag)) {
+        out.patch = 1;
+        delete attributes.src;
+        delete attributes.srcdoc;
+        delete attributes.data;
+      }
+      const state = formState(element);
+      if (state !== null) {
+        out.p = JSON.parse(state);
+        controls.set(id, { node: new WeakRef(element), state });
+      }
+    }
+    if (Object.keys(attributes).length)
+      out.a = attributes;
+    if (out.patch)
+      return out;
+    const children = [];
+    for (const child of Array.from(element.childNodes)) {
+      const described = serialize(child, ns);
+      if (described)
+        children.push(described);
+    }
+    if (children.length)
+      out.c = children;
+    const shadow = element.shadowRoot;
+    if (shadow) {
+      const inside = [];
+      for (const child of Array.from(shadow.childNodes)) {
+        const described = serialize(child, ns);
+        if (described)
+          inside.push(described);
+      }
+      out.s = inside;
+      if (shadow.adoptedStyleSheets.length)
+        out.sa = adoptedText(shadow.adoptedStyleSheets);
+      observedShadows.add(shadow);
+      observer.observe(shadow, { childList: true, attributes: true, characterData: true, subtree: true });
+    }
+    return out;
+  };
+  const childList = (parent, ns) => {
+    const out = [];
+    for (const child of Array.from(parent.childNodes)) {
+      if (ignored(child))
+        continue;
+      if (sent.has(child) && !detached.has(child)) {
+        out.push(ids.get(child));
+        continue;
+      }
+      const described = serialize(child, ns);
+      if (described)
+        out.push(described);
+    }
+    return out;
+  };
+  const nsOf = (node) => {
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : null;
+    if (!element)
+      return null;
+    return element.namespaceURI === SVG ? "s" : element.namespaceURI === MATH ? "m" : null;
+  };
+  const styleOwner = (node) => {
+    const parent = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement ?? null;
+    return parent && parent.namespaceURI === HTML && parent.localName === "style" ? parent : null;
+  };
+  const restyle = (element) => {
+    const id = ids.get(element);
+    if (!id || !sent.has(element))
+      return null;
+    const css = sheetText(element.sheet, element instanceof HTMLLinkElement ? element.href : document.baseURI);
+    if (css === null)
+      return null;
+    styles.set(id, { node: new WeakRef(element), rules: element.sheet?.cssRules.length ?? 0 });
+    return ["s", id, css];
+  };
+  const flush = (records) => {
+    if (!running || records.length === 0)
+      return;
+    const parents = new Set;
+    const attributes = new Map;
+    const texts = new Set;
+    const restyled = new Set;
+    for (const record of records) {
+      if (record.type === "childList") {
+        record.removedNodes.forEach((node) => detached.add(node));
+        const owner = styleOwner(record.target);
+        if (owner)
+          restyled.add(owner);
+        else
+          parents.add(record.target);
+      } else if (record.type === "attributes") {
+        const element = record.target;
+        let names = attributes.get(element);
+        if (!names)
+          attributes.set(element, names = new Set);
+        names.add(record.attributeName ?? "");
+      } else if (record.type === "characterData") {
+        const owner = styleOwner(record.target);
+        if (owner)
+          restyled.add(owner);
+        else
+          texts.add(record.target);
+      }
+    }
+    const ops = [];
+    const fresh = new WeakSet;
+    const markFresh = (node) => {
+      if (typeof node === "number")
+        return;
+      const live = byId.get(node.i)?.deref();
+      if (live)
+        fresh.add(live);
+      for (const child of node.c ?? [])
+        markFresh(child);
+      for (const child of node.s ?? [])
+        markFresh(child);
+    };
+    const ordered = Array.from(parents).filter((node) => node.isConnected).sort((a, b) => a === b ? 0 : a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+    for (const parent of ordered) {
+      if (parent.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+        const host = parent.host;
+        if (!host || !sent.has(host) || fresh.has(host) || detached.has(host))
+          continue;
+        const list = childList(parent, nsOf(host));
+        list.forEach(markFresh);
+        ops.push(["S", ids.get(host), list]);
+        continue;
+      }
+      if (parent.nodeType === Node.DOCUMENT_NODE) {
+        queue.push(snapshot());
+        return;
+      }
+      if (!sent.has(parent) || fresh.has(parent) || detached.has(parent) || ignored(parent))
+        continue;
+      if (PATCH.has(parent.localName))
+        continue;
+      const list = childList(parent, nsOf(parent));
+      list.forEach(markFresh);
+      ops.push(["c", ids.get(parent), list]);
+    }
+    for (const [element, names] of attributes) {
+      if (!sent.has(element) || fresh.has(element) || detached.has(element) || !element.isConnected)
+        continue;
+      const id = ids.get(element);
+      for (const name of names) {
+        if (!name || /^on/i.test(name))
+          continue;
+        if (element.localName === "img" && (name === "srcset" || name === "sizes"))
+          continue;
+        let value = element.getAttribute(name);
+        if (value !== null && URL_ATTRIBUTES.has(name) && !/^(javascript:|data:|blob:|#)/i.test(value))
+          value = absolute(value);
+        else if (value !== null && name === "style")
+          value = cssUrls(value, document.baseURI);
+        if (element.localName === "img" && name === "src")
+          value = element.currentSrc || value;
+        ops.push(["a", id, name, value]);
+      }
+    }
+    for (const node of texts) {
+      if (!sent.has(node) || fresh.has(node) || detached.has(node) || !node.isConnected)
+        continue;
+      ops.push(["t", ids.get(node), node.data]);
+    }
+    for (const element of restyled) {
+      const op = restyle(element);
+      if (op)
+        ops.push(op);
+    }
+    if (ops.length)
+      queue.push({ k: "ops", ops });
+  };
+  const sweep = () => {
+    if (!running)
+      return;
+    sweepShadows();
+    const ops = [];
+    for (const [id, entry] of styles) {
+      const element = entry.node.deref();
+      if (!element || !element.isConnected) {
+        styles.delete(id);
+        continue;
+      }
+      let count = 0;
+      try {
+        count = element.sheet?.cssRules.length ?? 0;
+      } catch {
+        continue;
+      }
+      if (count !== entry.rules) {
+        const op = restyle(element);
+        if (op)
+          ops.push(op);
+      }
+    }
+    for (const [id, entry] of controls) {
+      const element = entry.node.deref();
+      if (!element || !element.isConnected) {
+        controls.delete(id);
+        continue;
+      }
+      const state = formState(element);
+      if (state !== null && state !== entry.state) {
+        entry.state = state;
+        ops.push(["v", id, JSON.parse(state)]);
+      }
+    }
+    const nextAdopted = adoptedText(document.adoptedStyleSheets);
+    if (nextAdopted !== adopted) {
+      adopted = nextAdopted;
+      ops.push(["A", adopted]);
+    }
+    if (ops.length)
+      queue.push({ k: "ops", ops });
+  };
+  let lastShadowSweep = 0;
+  const sweepShadows = () => {
+    const now = Date.now();
+    if (now - lastShadowSweep < 1000)
+      return;
+    lastShadowSweep = now;
+    const ops = [];
+    for (const element of Array.from(document.querySelectorAll("*"))) {
+      const shadow = element.shadowRoot;
+      if (!shadow || observedShadows.has(shadow) || !sent.has(element) || detached.has(element))
+        continue;
+      observedShadows.add(shadow);
+      observer.observe(shadow, { childList: true, attributes: true, characterData: true, subtree: true });
+      ops.push(["S", ids.get(element), childList(shadow, nsOf(element))]);
+    }
+    if (ops.length)
+      queue.push({ k: "ops", ops });
+  };
+  const scrolls = new Map;
+  let scrollTimer = null;
+  const onScroll = (event) => {
+    if (!running)
+      return;
+    const target = event.target;
+    const element = target === document || target === window ? null : target;
+    if (element && !sent.has(element))
+      return;
+    const id = element ? ids.get(element) : 0;
+    scrolls.set(id, element ? [element.scrollLeft, element.scrollTop] : [window.scrollX, window.scrollY]);
+    scrollTimer ??= setTimeout(() => {
+      scrollTimer = null;
+      const ops = Array.from(scrolls, ([key, [left, top]]) => ["x", key, Math.round(left), Math.round(top)]);
+      scrolls.clear();
+      if (ops.length)
+        queue.push({ k: "ops", ops });
+    }, 50);
+  };
+  const snapshot = () => {
+    styles.clear();
+    controls.clear();
+    adopted = adoptedText(document.adoptedStyleSheets);
+    const root = document.documentElement ? serialize(document.documentElement, null) : null;
+    return {
+      k: "snap",
+      url: location.href,
+      title: document.title,
+      quirks: document.compatMode === "BackCompat",
+      root,
+      adopted,
+      scroll: [Math.round(window.scrollX), Math.round(window.scrollY)]
+    };
+  };
+  observer = new MutationObserver(flush);
+  let sweeper = null;
+  const api = {
+    start() {
+      if (running)
+        observer.takeRecords();
+      running = true;
+      queue = [snapshot()];
+      observer.observe(document, { childList: true, attributes: true, characterData: true, subtree: true });
+      if (!sweeper) {
+        document.addEventListener("scroll", onScroll, { capture: true, passive: true });
+        sweeper = setInterval(sweep, 400);
+      }
+    },
+    stop() {
+      running = false;
+      observer.disconnect();
+      if (sweeper)
+        clearInterval(sweeper);
+      sweeper = null;
+      document.removeEventListener("scroll", onScroll, { capture: true });
+      queue = [];
+    },
+    drain() {
+      flush(observer.takeRecords());
+      if (!queue.length)
+        return "";
+      const out = JSON.stringify(queue);
+      queue = [];
+      return out;
+    },
+    node(id) {
+      return byId.get(id)?.deref() ?? null;
+    },
+    idOf(node) {
+      return ids.get(node) ?? null;
+    }
+  };
+  world.__cloakMirror = api;
+}
+
+// service/mirror.ts
+var RECORDER = `(${mirrorRecorder.toString()})();`;
+var WORLD = "cloak-mirror";
+var DRAIN_MS = 50;
+var VIEWER_GONE_MS = 20000;
+var WAIT_MAX_MS = 15000;
+var LOG_BYTES_MAX = 6000000;
+var RESOURCES_BYTES_MAX = 5000000;
+var RESOURCE_BYTES_MAX = 4000000;
+var CACHE_BYTES_MAX = 150000000;
+var isText2 = (mime) => mime === "text/css" || mime === "image/svg+xml" || mime.startsWith("text/");
+var sleep3 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+class Mirror {
+  browser;
+  run = randomUUID();
+  tab = null;
+  contextId = null;
+  doc = 0;
+  seq = 0;
+  log = [];
+  logBytes = 0;
+  lastViewerAt = 0;
+  draining = false;
+  injecting = null;
+  waiters = new Set;
+  cache = new Map;
+  cacheBytes = 0;
+  mimeTypes = new Map;
+  constructor(browser) {
+    this.browser = browser;
+    browser.onShown((tab) => this.retarget(tab));
+    browser.onCdpEvent((event) => {
+      if (!this.tab || event.sessionId !== this.tab.sessionId)
+        return;
+      if (event.method === "Page.frameNavigated") {
+        const frame = event.params.frame;
+        if (!frame.parentId)
+          this.retarget(this.tab);
+      }
+    });
+  }
+  get watched() {
+    return Date.now() - this.lastViewerAt < VIEWER_GONE_MS;
+  }
+  async events(afterSeq, waitMs, run) {
+    const after = run === this.run ? afterSeq : 0;
+    this.lastViewerAt = Date.now();
+    this.browser.start().catch(() => {});
+    if (!this.tab && this.browser.shown)
+      this.retarget(this.browser.shown);
+    this.kick();
+    const snapshotAt = this.log.find((entry) => entry.message.k === "snap")?.seq ?? Infinity;
+    if (after < snapshotAt && this.log.length === 0) {
+      await this.next(Math.min(Math.max(waitMs, 0), WAIT_MAX_MS));
+    } else if (after >= snapshotAt && this.seq <= after) {
+      await this.next(Math.min(Math.max(waitMs, 0), WAIT_MAX_MS));
+    }
+    this.lastViewerAt = Date.now();
+    const snapshot = this.log.findIndex((entry) => entry.message.k === "snap");
+    const tab = this.tab?.id ?? null;
+    if (snapshot === -1)
+      return { run: this.run, tab, doc: this.doc, from: this.seq + 1, seq: this.seq, reset: false, messages: [] };
+    const reset = after < this.log[snapshot].seq;
+    const from = reset ? snapshot : this.log.findIndex((entry) => entry.seq > after);
+    const messages = from === -1 ? [] : this.log.slice(from).map((entry) => entry.message);
+    return { run: this.run, tab, doc: this.doc, from: from === -1 ? this.seq + 1 : this.log[from].seq, seq: this.seq, reset, messages };
+  }
+  async resources(urls) {
+    const resources = {};
+    const later = [];
+    let bytes = 0;
+    for (const url of urls) {
+      if (bytes > RESOURCES_BYTES_MAX) {
+        later.push(url);
+        continue;
+      }
+      const resource = await this.resource(url).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+      if (!resource) {
+        resources[url] = { error: "not found" };
+        continue;
+      }
+      if ("error" in resource) {
+        resources[url] = resource;
+        continue;
+      }
+      resources[url] = isText2(resource.mime) ? { mime: resource.mime, text: Buffer.from(resource.data, "base64").toString("utf8") } : resource;
+      bytes += resource.data.length;
+    }
+    return { resources, later };
+  }
+  retarget(tab) {
+    this.tab = tab;
+    this.contextId = null;
+    this.doc += 1;
+    this.mimeTypes = new Map;
+    this.log = [];
+    this.logBytes = 0;
+    this.wake();
+    this.kick();
+  }
+  append(message) {
+    const text = JSON.stringify(message);
+    if (message.k === "snap") {
+      this.log = [];
+      this.logBytes = 0;
+    }
+    this.seq += 1;
+    this.log.push({ seq: this.seq, message, bytes: text.length });
+    this.logBytes += text.length;
+  }
+  wake() {
+    const waiters = [...this.waiters];
+    this.waiters.clear();
+    for (const wake of waiters)
+      wake();
+  }
+  next(ms) {
+    if (ms <= 0)
+      return Promise.resolve();
+    return new Promise((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        this.waiters.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      this.waiters.add(wake);
+    });
+  }
+  kick() {
+    if (this.draining || !this.watched)
+      return;
+    this.draining = true;
+    this.loop().finally(() => {
+      this.draining = false;
+    });
+  }
+  async loop() {
+    while (this.watched) {
+      const tab = this.tab;
+      const cdp = this.browser.cdp;
+      if (!tab || !cdp || this.browser.phase !== "running") {
+        await sleep3(200);
+        if (!this.tab && this.browser.shown)
+          this.retarget(this.browser.shown);
+        continue;
+      }
+      if (this.contextId === null) {
+        this.injecting ??= this.inject(tab).finally(() => {
+          this.injecting = null;
+        });
+        await this.injecting;
+        if (this.contextId === null) {
+          await sleep3(200);
+          continue;
+        }
+      }
+      const doc = this.doc;
+      let text = "";
+      try {
+        const answer = await cdp.send("Runtime.evaluate", { expression: "globalThis.__cloakMirror ? globalThis.__cloakMirror.drain() : null", contextId: this.contextId, returnByValue: true }, tab.sessionId ?? undefined, 5000);
+        if (answer.result?.value === null || answer.exceptionDetails) {
+          this.contextId = null;
+          continue;
+        }
+        text = typeof answer.result?.value === "string" ? answer.result.value : "";
+      } catch {
+        this.contextId = null;
+        await sleep3(100);
+        continue;
+      }
+      if (doc === this.doc && text) {
+        for (const message of JSON.parse(text))
+          this.append(message);
+        if (this.logBytes > LOG_BYTES_MAX)
+          await this.restart(tab);
+        this.wake();
+      }
+      await sleep3(DRAIN_MS);
+    }
+    const tab = this.tab;
+    if (tab?.sessionId && this.contextId !== null && this.browser.cdp) {
+      await this.browser.cdp.send("Runtime.evaluate", { expression: "globalThis.__cloakMirror && globalThis.__cloakMirror.stop()", contextId: this.contextId }, tab.sessionId, 3000).catch(() => {});
+    }
+    this.contextId = null;
+  }
+  async inject(tab) {
+    const cdp = this.browser.cdp;
+    if (!cdp)
+      return;
+    try {
+      const session = await this.browser.sessionOf(tab);
+      const { frameTree } = await cdp.send("Page.getFrameTree", {}, session);
+      const { executionContextId } = await cdp.send("Page.createIsolatedWorld", { frameId: frameTree.frame.id, worldName: WORLD }, session);
+      await cdp.send("Runtime.evaluate", { expression: `${RECORDER}
+globalThis.__cloakMirror.start();`, contextId: executionContextId }, session, 1e4);
+      if (this.tab === tab)
+        this.contextId = executionContextId;
+    } catch {}
+  }
+  async restart(tab) {
+    if (this.contextId === null || !this.browser.cdp)
+      return;
+    await this.browser.cdp.send("Runtime.evaluate", { expression: "globalThis.__cloakMirror.start()", contextId: this.contextId }, tab.sessionId ?? undefined, 5000).catch(() => {});
+  }
+  remember(url, resource) {
+    this.cache.set(url, resource);
+    this.cacheBytes += resource.data.length;
+    for (const [key, value] of this.cache) {
+      if (this.cacheBytes <= CACHE_BYTES_MAX)
+        break;
+      this.cache.delete(key);
+      this.cacheBytes -= value.data.length;
+    }
+  }
+  async resource(url) {
+    const cached = this.cache.get(url);
+    if (cached) {
+      this.cache.delete(url);
+      this.cache.set(url, cached);
+      return cached;
+    }
+    const tab = this.tab ?? this.browser.shown;
+    const cdp = this.browser.cdp;
+    if (!tab || !cdp)
+      return null;
+    const session = await this.browser.sessionOf(tab);
+    const { frameTree } = await cdp.send("Page.getFrameTree", {}, session);
+    const frameId = frameTree.frame.id;
+    try {
+      const answer = await cdp.send("Page.getResourceContent", { frameId, url }, session, 8000);
+      const data = answer.base64Encoded ? answer.content : Buffer.from(answer.content, "utf8").toString("base64");
+      if (data.length <= RESOURCE_BYTES_MAX * 1.4) {
+        const resource = absoluteCss(url, { mime: await this.mimeOf(frameId, url, session), data });
+        this.remember(url, resource);
+        return resource;
+      }
+    } catch {}
+    const loaded = await cdp.send("Network.loadNetworkResource", { frameId, url, options: { disableCache: false, includeCredentials: true } }, session, 15000);
+    if (!loaded.resource.success || !loaded.resource.stream)
+      return null;
+    const chunks = [];
+    let total = 0;
+    try {
+      for (;; ) {
+        const part = await cdp.send("IO.read", { handle: loaded.resource.stream, size: 1048576 }, session, 15000);
+        const bytes = part.base64Encoded ? Buffer.from(part.data, "base64") : Buffer.from(part.data, "utf8");
+        chunks.push(bytes);
+        total += bytes.length;
+        if (total > RESOURCE_BYTES_MAX)
+          return null;
+        if (part.eof)
+          break;
+      }
+    } finally {
+      await cdp.send("IO.close", { handle: loaded.resource.stream }, session).catch(() => {});
+    }
+    const headers = loaded.resource.headers ?? {};
+    const type = Object.entries(headers).find(([key]) => key.toLowerCase() === "content-type")?.[1] ?? "";
+    const resource = absoluteCss(url, { mime: type.split(";")[0].trim() || guessMime(url), data: Buffer.concat(chunks).toString("base64") });
+    this.remember(url, resource);
+    return resource;
+  }
+  async mimeOf(frameId, url, session) {
+    if (!this.mimeTypes.has(url) && this.browser.cdp) {
+      try {
+        const { frameTree } = await this.browser.cdp.send("Page.getResourceTree", {}, session);
+        for (const entry of frameTree.resources ?? [])
+          this.mimeTypes.set(entry.url, entry.mimeType);
+      } catch {}
+    }
+    return this.mimeTypes.get(url) || guessMime(url);
+  }
+}
+var absoluteCss = (url, resource) => {
+  if (resource.mime !== "text/css")
+    return resource;
+  const resolve = (value) => {
+    if (!value || /^(data:|blob:|#|about:)/i.test(value))
+      return value;
+    try {
+      return new URL(value, url).href;
+    } catch {
+      return value;
+    }
+  };
+  const css = Buffer.from(resource.data, "base64").toString("utf8").replace(/url\(\s*(['"]?)([^'")]*)\1\s*\)/g, (_match, _quote, value) => `url("${resolve(value)}")`).replace(/@import\s+(['"])([^'"]+)\1/g, (_match, _quote, value) => `@import url("${resolve(value)}")`);
+  return { mime: resource.mime, data: Buffer.from(css, "utf8").toString("base64") };
+};
+var guessMime = (url) => {
+  const path = url.split(/[?#]/)[0].toLowerCase();
+  const ext = path.slice(path.lastIndexOf(".") + 1);
+  return {
+    css: "text/css",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    avif: "image/avif",
+    svg: "image/svg+xml",
+    ico: "image/x-icon",
+    woff2: "font/woff2",
+    woff: "font/woff",
+    ttf: "font/ttf",
+    otf: "font/otf"
+  }[ext] ?? "application/octet-stream";
+};
+
 // service/surface.ts
 import { deflateSync } from "node:zlib";
 var QUALITY = 80;
@@ -1943,6 +2708,7 @@ var MAX_HEIGHT = 2400;
 var MULTI_CLICK_MS = 500;
 var TYPING_MS = 1e4;
 var MULTI_CLICK_PX = 5;
+var PICTURE_IDLE_MS = 30000;
 var clamp = (value, min, max) => Math.max(min, Math.min(max, Math.round(value)));
 var jpegSize = (bytes) => {
   let at = 2;
@@ -2097,6 +2863,7 @@ class Surface {
   typing = null;
   typingSeq = 0;
   sized = false;
+  pictureAt = 0;
   constructor(browser) {
     this.browser = browser;
     this.dpr = browser.scaleFactor;
@@ -2143,6 +2910,10 @@ class Surface {
   }
   async frameAfter(after, waitMs) {
     this.browser.start().catch(() => {});
+    const watched = this.pictureWatched;
+    this.pictureAt = Date.now();
+    if (!watched && this.browser.shown)
+      this.recast(this.browser.shown);
     const wait = clamp(waitMs, 0, FRAME_WAIT_MAX_MS);
     if (this.seq <= after && wait > 0)
       await this.next(wait);
@@ -2199,6 +2970,9 @@ class Surface {
   }
   get agentActive() {
     return Date.now() < this.agentUntil;
+  }
+  get pictureWatched() {
+    return Date.now() - this.pictureAt < PICTURE_IDLE_MS;
   }
   fill() {
     this.browser.fillSize = { width: Math.max(100, Math.round(this.deviceWidth / this.dpr)), height: Math.max(100, Math.round(this.deviceHeight / this.dpr)) };
@@ -2268,6 +3042,10 @@ class Surface {
     }
     if (event.method !== "Page.screencastFrame" || !event.sessionId || event.sessionId !== this.castSession)
       return;
+    if (!this.pictureWatched) {
+      this.browser.cdp?.send("Page.stopScreencast", {}, event.sessionId).catch(() => {});
+      return;
+    }
     const params = event.params;
     this.browser.cdp?.send("Page.screencastFrameAck", { sessionId: params.sessionId }, event.sessionId).catch(() => {});
     const bytes = Buffer.from(params.data, "base64");
@@ -2309,6 +3087,8 @@ class Surface {
     if (this.castSession !== session)
       this.lastPress = { at: 0, x: 0, y: 0, button: "none", count: 0, url: "" };
     this.castSession = session;
+    if (!this.pictureWatched)
+      return;
     await cdp.send("Page.startScreencast", { format: "jpeg", quality: QUALITY, maxWidth: this.deviceWidth, maxHeight: this.deviceHeight, everyNthFrame: 1 }, session);
     const shot = await cdp.send("Page.captureScreenshot", { format: "jpeg", quality: QUALITY }, session, 3000).catch(() => null);
     if (shot && this.castSession === session) {
@@ -2514,9 +3294,9 @@ class Surface {
     if (this.mac && key === "Backspace" && event.modifiers.alt)
       modifiers = modifiers & ~1 | 2;
     const windowsVirtualKeyCode = keyCodeOf(key, code, key === event.key ? event.keyCode : undefined);
-    const location = locationOf(code);
+    const location2 = locationOf(code);
     if (event.action === "up") {
-      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key, code, windowsVirtualKeyCode, modifiers, location }, sessionId);
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key, code, windowsVirtualKeyCode, modifiers, location: location2 }, sessionId);
       return;
     }
     const control = (modifiers & 2) !== 0;
@@ -2529,7 +3309,7 @@ class Surface {
       code,
       windowsVirtualKeyCode,
       modifiers,
-      location,
+      location: location2,
       ...text ? { text, unmodifiedText: text } : {},
       ...commands ? { commands } : {}
     }, sessionId);
@@ -2552,6 +3332,7 @@ var browser = new Browser({
 });
 var surface = new Surface(browser);
 var agent = new Agent(browser, surface);
+var mirror = new Mirror(browser);
 var readBody = (req) => new Promise((resolve, reject) => {
   let body = "";
   req.setEncoding("utf8");
@@ -2626,6 +3407,29 @@ var route = async (req, res) => {
         default:
           return send(res, 400, { ok: false, error: "action is new, show or close" });
       }
+    }
+    case "GET /mirror/events": {
+      const after = Number(url.searchParams.get("after")) || 0;
+      const wait = Number(url.searchParams.get("wait")) || 0;
+      return send(res, 200, await mirror.events(after, wait, url.searchParams.get("run") ?? ""));
+    }
+    case "POST /mirror/wake":
+      mirror.wake();
+      return send(res, 200, { ok: true });
+    case "POST /mirror/resources": {
+      const body = await readJson(req);
+      const urls = Array.isArray(body?.urls) ? body.urls.filter((value) => typeof value === "string" && /^https?:/i.test(value)).slice(0, 200) : [];
+      return send(res, 200, await mirror.resources(urls));
+    }
+    case "POST /mirror/view": {
+      const body = await readJson(req);
+      const width = Number(body?.width);
+      const height = Number(body?.height);
+      const dpr = typeof body?.dpr === "number" && Number.isFinite(body.dpr) ? body.dpr : 1;
+      if (!(width > 0 && height > 0))
+        return send(res, 400, { ok: false, error: "width and height are required" });
+      surface.viewer(dpr, body?.mac === true);
+      return send(res, 200, { ok: true, ...surface.resize(width, height) });
     }
     case "POST /address": {
       const body = await readJson(req);
