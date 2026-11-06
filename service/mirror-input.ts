@@ -4,7 +4,8 @@
 // A pointer or wheel event names the node it was over in the panel and where on it; it lands on that node in the
 // page, wherever the page has it (mirror-recorder.ts, locate), so a page laid out a little differently (a font
 // that differs) still gets the click on the right thing. Input made on a document the panel no longer shows is not
-// applied to the new one, except a button's release.
+// applied to the new one, except a button's release. The page as a picture (the panel's fallback) sends positions
+// on the screen (`r` -2) and no document (`doc` -1): they go where they are.
 import type { SurfaceInputEvent, SurfaceModifiers } from '@openchamber/sdk';
 
 import type { Mirror } from './mirror.ts';
@@ -96,10 +97,10 @@ export const applyMirrorInput = async (input: MirrorInput, mirror: Mirror, surfa
     switch (event.type) {
       case 'pointer':
       case 'wheel': {
-        const current = input.doc === mirror.document;
+        const current = input.doc === -1 || input.doc === mirror.document;
         // On a document the panel no longer shows, only a release goes (no button stays held), where it was.
         if (!current && !(event.type === 'pointer' && event.action === 'up')) continue;
-        const placed = current ? await mirror.locate(input.doc, event.id, event.r, event.fx, event.fy) : null;
+        const placed = current && event.r !== -2 && input.doc !== -1 ? await mirror.locate(input.doc, event.id, event.r, event.fx, event.fy) : null;
         const [x, y] = placed ?? [event.x, event.y];
         if (event.type === 'pointer') {
           batch.push({ type: 'pointer', action: event.action, x, y, button: event.button, buttons: event.buttons, modifiers: event.modifiers });

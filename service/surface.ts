@@ -303,6 +303,11 @@ export class Surface {
     return typeof value === 'string' ? value : '';
   }
 
+  /** The page's size in CSS pixels, which a picture's pixels stand for. */
+  get pageSize(): { width: number; height: number } {
+    return { width: this.cssWidth, height: this.cssHeight };
+  }
+
   /** The agent is acting: frames carry it for a moment after. */
   noteAgent(): void {
     this.agentUntil = Date.now() + 4000;

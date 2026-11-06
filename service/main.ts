@@ -133,7 +133,27 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
       // The page as HTML for the panel: everything after `after`, waiting up to `wait` ms for news.
       const after = Number(url.searchParams.get('after')) || 0;
       const wait = Number(url.searchParams.get('wait')) || 0;
-      return send(res, 200, await mirror.events(after, wait, url.searchParams.get('run') ?? ''));
+      const patch = Number(url.searchParams.get('patch')) || 0;
+      return send(res, 200, await mirror.events(after, wait, url.searchParams.get('run') ?? '', patch, url.searchParams.get('mode') === 'picture'));
+    }
+    case 'GET /mirror/picture': {
+      // The page as a picture (the panel's fallback): the screencast's newest frame after `after`, waiting up to
+      // `wait` ms, under OpenChamber's 20 s for a request. `data` is absent when nothing newer came.
+      const after = Number(url.searchParams.get('after')) || 0;
+      const wait = Math.min(15_000, Number(url.searchParams.get('wait')) || 0);
+      const answer = await surface.frameAfter(after, wait);
+      if (!answer) return send(res, 200, { seq: after });
+      const { width, height } = surface.pageSize;
+      return send(res, 200, {
+        seq: answer.seq,
+        mime: answer.frame.mime,
+        data: answer.frame.bytes.toString('base64'),
+        width: answer.frame.width,
+        height: answer.frame.height,
+        pageWidth: width,
+        pageHeight: height,
+        agentActive: answer.agentActive,
+      });
     }
     case 'POST /mirror/input': {
       // The user's pointer, wheel, keys and text on the page in the panel, made real input in the page.

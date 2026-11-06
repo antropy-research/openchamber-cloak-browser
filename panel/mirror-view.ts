@@ -5,9 +5,15 @@
 //
 // The frame's document is made once and kept: a new page replaces its root, so the resources it already holds stay.
 // Messages to and from it carry `cloak: true` (frame.ts lists them).
+//
+// Where HTML cannot show the page, the view shows it as a picture instead (picture-view.ts): when pictured elements
+// (canvas, video, other sites' frames) take half the window or more, until they take less than a third; when the frame
+// keeps failing to follow the page; or when the user asks (the strip's button). A new page starts as HTML again.
 import type { HostClient } from '@openchamber/sdk';
 
-type Answer = { run: string; tab: string | null; doc: number; from: number; seq: number; reset: boolean; messages: unknown[] };
+import { PictureView } from './picture-view.ts';
+
+type Answer = { run: string; tab: string | null; doc: number; from: number; seq: number; reset: boolean; messages: unknown[]; patches?: unknown[]; patchSeq?: number; coverage?: number };
 type Resource = { mime: string; data: string } | { mime: string; text: string } | { error: string };
 type FrameMessage = { cloak?: boolean; type?: string; urls?: unknown; doc?: unknown; events?: unknown };
 type InputBatch = { doc: number; events: unknown[] };
@@ -18,15 +24,25 @@ const WAIT_MS = 15_000;
 const URLS_BYTES_MAX = 40_000;
 /** Resource requests at once: a page's first view asks for many, the service answers each from the browser. */
 const FETCHES_MAX = 2;
+/** Pictured elements taking this much of the window or more make the view a picture; less than LOW, HTML again. */
+const COVERAGE_HIGH = 0.5;
+const COVERAGE_LOW = 0.3;
+/** This many failed changes in RESYNC_WINDOW_MS, and the page is shown as a picture. */
+const RESYNCS_MAX = 3;
+const RESYNC_WINDOW_MS = 30_000;
 /** The frame's own document: a script of ours and nothing else; the page's arrive as data. */
 const FRAME_DOCUMENT = '<!doctype html><html><head><meta charset="utf-8"></head><body><script src="frame.js"></script></body></html>';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+export type ViewMode = { picture: boolean; chosen: boolean };
+
 export type MirrorViewOptions = {
   host: HostClient;
   /** The page has been shown (its first snapshot), or the view has none to show. */
   onShown?: (shown: boolean) => void;
+  /** The view became a picture or HTML again; `chosen`: the user asked for it. */
+  onMode?: (mode: ViewMode) => void;
 };
 
 export class MirrorView {
@@ -34,11 +50,20 @@ export class MirrorView {
   private readonly frame: HTMLIFrameElement;
   private readonly host: HostClient;
   private readonly onShown: (shown: boolean) => void;
+  private readonly onMode: (mode: ViewMode) => void;
+  private readonly picture: PictureView;
+  /** The user's choice for this page (null: none), and what the page itself calls for. */
+  private chosen: boolean | null = null;
+  private auto = false;
+  private resyncs: number[] = [];
+  private doc = -1;
   private ready = false;
   /** What arrived before the frame was ready: given to it once it is. */
   private queued: unknown[] = [];
   private run = '';
   private after = 0;
+  /** The newest picture of an element (a canvas, a frame) this view has. */
+  private patchAfter = 0;
   private shown = false;
   private stopped = false;
   private readonly wanted = new Set<string>();
@@ -52,6 +77,7 @@ export class MirrorView {
   constructor(parent: HTMLElement, options: MirrorViewOptions) {
     this.host = options.host;
     this.onShown = options.onShown ?? (() => {});
+    this.onMode = options.onMode ?? (() => {});
     this.element = document.createElement('div');
     this.element.className = 'view';
     this.frame = document.createElement('iframe');
@@ -62,6 +88,7 @@ export class MirrorView {
     this.frame.srcdoc = FRAME_DOCUMENT;
     this.element.append(this.frame);
     parent.append(this.element);
+    this.picture = new PictureView(this.element, this.host, (events) => this.queueInput({ doc: -1, events }));
     window.addEventListener('message', (event) => {
       if (event.source !== this.frame.contentWindow) return;
       this.fromFrame(event.data as FrameMessage);
@@ -90,7 +117,30 @@ export class MirrorView {
 
   /** The keyboard to the page, as after Enter in the address field. */
   focus(): void {
-    this.frame.focus();
+    if (this.picture.shown) this.picture.focus();
+    else this.frame.focus();
+  }
+
+  get mode(): ViewMode {
+    return { picture: this.chosen ?? this.auto, chosen: this.chosen !== null };
+  }
+
+  /** The strip's button: the page as a picture, or as HTML again. */
+  togglePicture(): void {
+    this.chosen = !this.mode.picture;
+    this.applyMode();
+  }
+
+  private applyMode(): void {
+    const { picture } = this.mode;
+    if (picture === this.picture.shown) return;
+    const hadFocus = document.activeElement === this.frame || document.activeElement === this.picture.element;
+    if (picture) this.picture.show();
+    else this.picture.hide();
+    // Under the picture, the frame keeps following the page (so HTML comes back at once) but takes no input.
+    this.frame.style.visibility = picture ? 'hidden' : '';
+    if (hadFocus) this.focus();
+    this.onMode(this.mode);
   }
 
   private toFrame(message: Record<string, unknown>): void {
@@ -121,12 +171,20 @@ export class MirrorView {
       case 'input':
         if (typeof message.doc === 'number' && Array.isArray(message.events)) this.queueInput({ doc: message.doc, events: message.events });
         return;
-      case 'resync':
+      case 'resync': {
         // The frame could not apply a change (a node it does not have): the page again, whole. The request waiting
-        // for news is answered at once, so the next one asks for the page.
+        // for news is answered at once, so the next one asks for the page. A page this keeps happening on is shown
+        // as a picture.
+        const now = Date.now();
+        this.resyncs = [...this.resyncs.filter((at) => now - at < RESYNC_WINDOW_MS), now];
+        if (this.resyncs.length >= RESYNCS_MAX && !this.auto) {
+          this.auto = true;
+          this.applyMode();
+        }
         this.after = 0;
         void this.host.serviceRequest({ method: 'POST', path: '/mirror/wake', body: '{}' }).catch(() => {});
         return;
+      }
       default:
     }
   }
@@ -136,7 +194,7 @@ export class MirrorView {
     while (!this.stopped) {
       let answer: Answer;
       try {
-        const query = new URLSearchParams({ after: String(this.after), wait: String(WAIT_MS), run: this.run });
+        const query = new URLSearchParams({ after: String(this.after), wait: String(WAIT_MS), run: this.run, patch: String(this.patchAfter), ...(this.mode.picture ? { mode: 'picture' } : {}) });
         const result = await this.host.serviceRequest({ method: 'GET', path: `/mirror/events?${query}` });
         if (result.status !== 200) throw new Error(`HTTP ${result.status}`);
         answer = JSON.parse(result.body) as Answer;
@@ -157,6 +215,7 @@ export class MirrorView {
       // for this view is the page whole.
       this.run = answer.run;
       this.after = 0;
+      this.patchAfter = 0;
       this.sizeChanged(true);
       if (!answer.reset) return;
     }
@@ -170,7 +229,20 @@ export class MirrorView {
       messages = messages.slice(Math.max(0, this.after + 1 - answer.from));
     }
     this.after = answer.seq;
+    if (answer.doc !== this.doc) {
+      // A new page: HTML again, until it calls for a picture.
+      this.doc = answer.doc;
+      this.chosen = null;
+      this.auto = false;
+      this.resyncs = [];
+    }
+    const coverage = typeof answer.coverage === 'number' ? answer.coverage : 0;
+    if (!this.auto && coverage >= COVERAGE_HIGH) this.auto = true;
+    else if (this.auto && coverage < COVERAGE_LOW && this.resyncs.length < RESYNCS_MAX) this.auto = false;
+    this.applyMode();
     if (messages.length) this.toFrame({ type: 'events', doc: answer.doc, reset: answer.reset, messages });
+    if (answer.patches?.length) this.toFrame({ type: 'patches', doc: answer.doc, patches: answer.patches });
+    if (typeof answer.patchSeq === 'number') this.patchAfter = answer.patchSeq;
     const shown = answer.tab !== null && (this.shown || messages.some((message) => (message as { k?: string }).k === 'snap'));
     if (shown !== this.shown) {
       this.shown = shown;

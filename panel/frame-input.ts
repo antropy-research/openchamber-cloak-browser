@@ -9,8 +9,9 @@
 // own scrolls (the agent, a script) show here when the user is not scrolling that scroller.
 //
 // Focus follows the page's (the `f` change), without taking the keyboard from OpenChamber when the frame does not
-// have it.
-export type Modifiers = { alt: boolean; ctrl: boolean; meta: boolean; shift: boolean };
+// have it. Keys follow keys.ts.
+import { keepLocal, type Modifiers, modifiersOf, pasteChord } from './keys.ts';
+
 type Placed = { id: number; r: number; fx: number; fy: number; x: number; y: number };
 export type FrameInput =
   | ({ type: 'pointer'; action: 'down' | 'up' | 'move'; button: number; buttons: number; modifiers: Modifiers } & Placed)
@@ -24,6 +25,8 @@ export type InputHooks = {
   /** The node's number in the page, for the frame's own nodes. */
   idOf: (node: Node) => number | undefined;
   nodeOf: (id: number) => Node | undefined;
+  /** A pictured frame under the point: it takes no pointer events of its own, so the path does not name it. */
+  patchAt: (x: number, y: number) => Element | null;
   send: (events: FrameInput[]) => void;
 };
 
@@ -37,10 +40,6 @@ const WHEEL_SCROLL_MS = 250;
 const KEY_SCROLL_MS = 800;
 /** The page's focus does not move the frame's for this long after the user put it somewhere. */
 const FOCUS_HOLD_MS = 400;
-
-const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-
-const modifiersOf = (event: MouseEvent | KeyboardEvent): Modifiers => ({ alt: event.altKey, ctrl: event.ctrlKey, meta: event.metaKey, shift: event.shiftKey });
 
 const editable = (element: Element | null): boolean => {
   if (!element) return false;
@@ -140,9 +139,10 @@ export const startInput = (hooks: InputHooks) => {
 
   // Pointer and wheel: placed on the node under them.
   const place = (event: MouseEvent): Placed | null => {
-    let element: Element | null = null;
-    let id: number | undefined;
-    for (const item of event.composedPath()) {
+    let element: Element | null = hooks.patchAt(event.clientX, event.clientY);
+    let id: number | undefined = element ? hooks.idOf(element) : undefined;
+    if (id === undefined) element = null;
+    for (const item of element ? [] : event.composedPath()) {
       if (!(item instanceof Element)) continue;
       id = hooks.idOf(item);
       if (id !== undefined) {
@@ -222,29 +222,13 @@ export const startInput = (hooks: InputHooks) => {
     send([{ type: 'wheel', deltaX: round(event.deltaX * scale), deltaY: round(event.deltaY * scale), modifiers: modifiersOf(event), ...placed }]);
   }, { capture: true, passive: true });
 
-  // Keys: all go to the page, as in the panel's picture before. What a key would do in OpenChamber's window instead
-  // (reload it, go back in its history, move the focus by the page's rules) is kept from this frame.
+  // Keys: all go to the page (keys.ts); what OpenChamber's window would do with one is kept from it.
   const sentDown = new Set<string>();
-  const pasteChord = (event: KeyboardEvent): boolean => (mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) && !event.altKey && (event.code === 'KeyV' || event.key.toLowerCase() === 'v');
-  const keepLocal = (event: KeyboardEvent): boolean => {
-    const mod = mac ? event.metaKey : event.ctrlKey;
-    if (event.key === 'Tab' && !event.ctrlKey && !event.metaKey) return true;
-    if (event.key === 'F5' || event.key === 'F6') return true;
-    if (!mac && event.altKey && !event.ctrlKey && !event.metaKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return true;
-    if (!mod) return false;
-    const letter = event.key.length === 1 ? event.key.toLowerCase() : '';
-    // Editing and finding stay with this browser too: copy, cut, paste, select all, undo, find, zoom.
-    if ('cxvazyf'.includes(letter) && letter) return false;
-    if (event.key === '+' || event.key === '-' || event.key === '=' || event.key === '0') return false;
-    // In a field, a chord moves or deletes by word or line here, as it does in the page.
-    if (editable(focused()) && /^(Arrow|Backspace|Delete|Home|End)/.test(event.key)) return false;
-    return true;
-  };
   window.addEventListener('keydown', (event) => {
     lastKeyAt = Date.now();
     if (composing || event.isComposing || event.keyCode === 229) return;
     if (pasteChord(event)) return;
-    if (keepLocal(event)) event.preventDefault();
+    if (keepLocal(event, editable(focused()))) event.preventDefault();
     keyText = event.key.length === 1 && !event.ctrlKey && !event.metaKey ? { text: event.key, at: Date.now() } : null;
     sentDown.add(event.code || event.key);
     send([{ type: 'key', action: 'down', key: event.key, code: event.code, keyCode: event.keyCode, modifiers: modifiersOf(event) }]);

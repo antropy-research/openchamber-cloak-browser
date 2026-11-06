@@ -6,7 +6,12 @@
 // gets the snapshot and what followed. Resources the page uses (styles it could not read, images, fonts) come through
 // the browser (`resources`), from what the page already loaded or over its own network with its cookies, so the panel
 // never reaches the site itself.
-import { randomUUID } from 'node:crypto';
+//
+// What HTML cannot carry (a canvas, a video, another site's frame, a plugin) goes as pictures of those elements
+// (patches): the part the window shows, captured while a panel watches, a few times a second for a canvas or a video
+// and once a second for the rest, and sent only when it changed. Patches go beside the log, not in it: a panel gets
+// the newest of each.
+import { createHash, randomUUID } from 'node:crypto';
 
 import type { Browser, Tab } from './browser.ts';
 import { mirrorRecorder } from './mirror-recorder.ts';
@@ -25,6 +30,13 @@ const LOG_BYTES_MAX = 6_000_000;
 const RESOURCES_BYTES_MAX = 5_000_000;
 const RESOURCE_BYTES_MAX = 4_000_000;
 const CACHE_BYTES_MAX = 150_000_000;
+/** How often the pictured elements are looked at, and how often each is captured at most. */
+const PATCH_SCAN_MS = 250;
+const PATCH_MOVING_MS = 250;
+const PATCH_STILL_MS = 1000;
+/** Patches in one answer, base64 included: the rest come with the next. */
+const PATCH_BYTES_MAX = 2_000_000;
+const PATCH_QUALITY = 75;
 
 type Entry = { seq: number; message: unknown; bytes: number };
 /**
@@ -32,7 +44,22 @@ type Entry = { seq: number; message: unknown; bytes: number };
  * (a panel drops what it already has), `seq` the last one's, `reset` whether the first is a snapshot that replaces the
  * page.
  */
-export type MirrorAnswer = { run: string; tab: string | null; doc: number; from: number; seq: number; reset: boolean; messages: unknown[] };
+export type MirrorAnswer = {
+  run: string;
+  tab: string | null;
+  doc: number;
+  from: number;
+  seq: number;
+  reset: boolean;
+  messages: unknown[];
+  /** Pictures of elements HTML cannot carry, newer than the panel's `patch`; `patchSeq` is the newest it now has. */
+  patches: Patch[];
+  patchSeq: number;
+  /** How much of the window those elements take (0 to 1): past half, the panel shows the page as a picture. */
+  coverage: number;
+};
+/** A picture of the part of element `id` the window shows: `w`×`h` CSS pixels from (`dx`, `dy`) in its border box. */
+export type Patch = { id: number; seq: number; mime: string; data: string; dx: number; dy: number; w: number; h: number };
 type Resource = { mime: string; data: string };
 /**
  * A resource as the panel gets it: text as text (style sheets, SVG), so OpenChamber's compression of the answer works
@@ -60,6 +87,12 @@ export class Mirror {
   private readonly cache = new Map<string, Resource>();
   private cacheBytes = 0;
   private mimeTypes = new Map<string, string>();
+  private patches = new Map<number, Patch & { hash: string; at: number }>();
+  private patchSeq = 0;
+  private patchScanAt = 0;
+  private coverage = 0;
+  /** When a panel last wanted the pictures: one that shows the whole page as a picture needs none. */
+  private patchesWantedAt = 0;
 
   constructor(private readonly browser: Browser) {
     browser.onShown((tab) => this.retarget(tab));
@@ -80,26 +113,47 @@ export class Mirror {
    * `GET /mirror/events?after=n&wait=ms&run=r`: what the panel lacks, waiting for news up to `wait`. A panel that knew
    * another run has nothing of this one's.
    */
-  async events(afterSeq: number, waitMs: number, run: string): Promise<MirrorAnswer> {
-    const after = run === this.run ? afterSeq : 0;
+  async events(afterSeq: number, waitMs: number, run: string, patchAfterSeq = 0, picture = false): Promise<MirrorAnswer> {
+    const known = run === this.run;
+    const after = known ? afterSeq : 0;
+    const patchAfter = known ? patchAfterSeq : 0;
     this.lastViewerAt = Date.now();
+    if (!picture) this.patchesWantedAt = Date.now();
     void this.browser.start().catch(() => {});
     if (!this.tab && this.browser.shown) this.retarget(this.browser.shown);
     this.kick();
-    const snapshotAt = this.log.find((entry) => (entry.message as { k?: string }).k === 'snap')?.seq ?? Infinity;
-    if (after < snapshotAt && this.log.length === 0) {
-      await this.next(Math.min(Math.max(waitMs, 0), WAIT_MAX_MS));
-    } else if (after >= snapshotAt && this.seq <= after) {
-      await this.next(Math.min(Math.max(waitMs, 0), WAIT_MAX_MS));
-    }
+    const news = (): boolean => {
+      const snapshotAt = this.log.find((entry) => (entry.message as { k?: string }).k === 'snap')?.seq ?? Infinity;
+      if (this.log.length && (after < snapshotAt || this.seq > after)) return true;
+      return after >= snapshotAt && this.patchSeq > patchAfter;
+    };
+    if (!news()) await this.next(Math.min(Math.max(waitMs, 0), WAIT_MAX_MS));
     this.lastViewerAt = Date.now();
     const snapshot = this.log.findIndex((entry) => (entry.message as { k?: string }).k === 'snap');
     const tab = this.tab?.id ?? null;
-    if (snapshot === -1) return { run: this.run, tab, doc: this.doc, from: this.seq + 1, seq: this.seq, reset: false, messages: [] };
+    if (snapshot === -1) return { run: this.run, tab, doc: this.doc, from: this.seq + 1, seq: this.seq, reset: false, messages: [], patches: [], patchSeq: patchAfter, coverage: this.coverage };
     const reset = after < this.log[snapshot].seq;
     const from = reset ? snapshot : this.log.findIndex((entry) => entry.seq > after);
     const messages = from === -1 ? [] : this.log.slice(from).map((entry) => entry.message);
-    return { run: this.run, tab, doc: this.doc, from: from === -1 ? this.seq + 1 : this.log[from].seq, seq: this.seq, reset, messages };
+    // A panel that builds the page again needs every picture again.
+    const { patches, patchSeq } = this.patchesAfter(reset ? 0 : patchAfter);
+    return { run: this.run, tab, doc: this.doc, from: from === -1 ? this.seq + 1 : this.log[from].seq, seq: this.seq, reset, messages, patches, patchSeq, coverage: this.coverage };
+  }
+
+  /** The pictures newer than `after`, oldest first, as many as one answer holds. */
+  private patchesAfter(after: number): { patches: Patch[]; patchSeq: number } {
+    const newer = [...this.patches.values()].filter((patch) => patch.seq > after).sort((a, b) => a.seq - b.seq);
+    const patches: Patch[] = [];
+    let bytes = 0;
+    let patchSeq = after;
+    for (const { hash: _hash, at: _at, ...patch } of newer) {
+      if (patches.length && bytes + patch.data.length > PATCH_BYTES_MAX) break;
+      patches.push(patch);
+      bytes += patch.data.length;
+      patchSeq = patch.seq;
+    }
+    if (patches.length === newer.length) patchSeq = Math.max(patchSeq, this.patchSeq);
+    return { patches, patchSeq };
   }
 
   /** The shown document's number: input made on another document's nodes is not applied to this one's. */
@@ -174,6 +228,8 @@ export class Mirror {
     this.contextId = null;
     this.doc += 1;
     this.mimeTypes = new Map();
+    this.patches = new Map();
+    this.coverage = 0;
     // A new document: the panel starts over from its snapshot.
     this.log = [];
     this.logBytes = 0;
@@ -264,6 +320,10 @@ export class Mirror {
         if (this.logBytes > LOG_BYTES_MAX) await this.restart(tab);
         this.wake();
       }
+      if (doc === this.doc && Date.now() - this.patchScanAt >= PATCH_SCAN_MS) {
+        this.patchScanAt = Date.now();
+        if (await this.capturePatches(tab, doc)) this.wake();
+      }
       await sleep(DRAIN_MS);
     }
     // Nobody watches: the recorder rests until a panel asks again.
@@ -272,6 +332,41 @@ export class Mirror {
       await this.browser.cdp.send('Runtime.evaluate', { expression: 'globalThis.__cloakMirror && globalThis.__cloakMirror.stop()', contextId: this.contextId }, tab.sessionId, 3000).catch(() => {});
     }
     this.contextId = null;
+  }
+
+  /** Pictures of the elements HTML cannot carry that the window shows, where due and changed. */
+  private async capturePatches(tab: Tab, doc: number): Promise<boolean> {
+    const cdp = this.browser.cdp;
+    const found = await this.call(doc, 'patches()') as { view?: [number, number]; list?: Array<[number, number, number, number, number, number, number, string]> } | null;
+    const list = Array.isArray(found?.list) ? found.list : [];
+    const area = found?.view ? found.view[0] * found.view[1] : 0;
+    const coverage = area > 0 ? Math.min(1, list.reduce((sum, entry) => sum + entry[3] * entry[4], 0) / area) : 0;
+    let changed = Math.abs(coverage - this.coverage) > 0.05;
+    this.coverage = Math.round(coverage * 100) / 100;
+    if (!cdp || !tab.sessionId || !list.length || Date.now() - this.patchesWantedAt > VIEWER_GONE_MS) return changed;
+    for (const entry of list) {
+      const [id, x, y, w, h, dx, dy, tag] = entry;
+      const known = this.patches.get(id);
+      const every = tag === 'canvas' || tag === 'video' ? PATCH_MOVING_MS : PATCH_STILL_MS;
+      const moved = !known || known.dx !== dx || known.dy !== dy || known.w !== w || known.h !== h;
+      if (!moved && Date.now() - known.at < every) continue;
+      const shot = await cdp.send<{ data: string }>(
+        'Page.captureScreenshot',
+        { format: 'jpeg', quality: PATCH_QUALITY, clip: { x, y, width: w, height: h, scale: 1 }, captureBeyondViewport: false },
+        tab.sessionId,
+        3000,
+      ).catch(() => null);
+      if (!shot || doc !== this.doc) return changed;
+      const hash = createHash('sha1').update(shot.data).digest('base64');
+      if (known && !moved && known.hash === hash) {
+        known.at = Date.now();
+        continue;
+      }
+      this.patchSeq += 1;
+      this.patches.set(id, { id, seq: this.patchSeq, mime: 'image/jpeg', data: shot.data, dx, dy, w, h, hash, at: Date.now() });
+      changed = true;
+    }
+    return changed;
   }
 
   private async inject(tab: Tab): Promise<void> {

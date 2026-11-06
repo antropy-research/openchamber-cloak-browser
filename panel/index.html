@@ -25,6 +25,10 @@
       /* The page: a web page's own canvas is white, whatever OpenChamber's theme. */
       .view { position: relative; flex: 1; min-height: 0; overflow: hidden; background: #fff; }
       .view .page { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; background: #fff; color-scheme: light; }
+      .view .picture { position: absolute; inset: 0; outline: none; background: #fff; }
+      .view .picture[hidden] { display: none; }
+      .view .picture img { display: block; width: 100%; height: 100%; user-select: none; -webkit-user-drag: none; }
+      button[aria-pressed="true"] { color: var(--oc-primary-text, var(--oc-primary)); background: color-mix(in srgb, var(--oc-primary, #3b82f6) 12%, transparent); }
       .placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; text-align: center; background: var(--oc-bg); color: var(--oc-muted); }
       .placeholder[hidden] { display: none; }
       .dialog { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); width: min(420px, calc(100% - 24px)); box-sizing: border-box; display: flex; flex-direction: column; gap: 10px; padding: 16px; border-radius: var(--oc-radius, 8px); background: var(--oc-elevated, var(--oc-bg)); color: var(--oc-elevated-fg, var(--oc-fg)); box-shadow: 0 8px 28px rgb(0 0 0 / .22), 0 0 0 1px color-mix(in srgb, var(--oc-fg) 10%, transparent); }

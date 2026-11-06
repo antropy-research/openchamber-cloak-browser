@@ -45,6 +45,8 @@ export function mirrorRecorder(): void {
   /** Nodes removed from the page since they were sent: described whole again if they come back. */
   const detached = new WeakSet<Node>();
   const styles = new Map<number, { node: WeakRef<Element>; rules: number }>();
+  /** Elements the panel shows as pictures (canvas, video, frames, plugins): the service captures them (`patches`). */
+  const patchNodes = new Map<number, WeakRef<Element>>();
   const controls = new Map<number, { node: WeakRef<Element>; state: string }>();
   let nextId = 1;
   let queue: Json[] = [];
@@ -182,6 +184,7 @@ export function mirrorRecorder(): void {
         delete attributes.src;
         delete attributes.srcdoc;
         delete attributes.data;
+        patchNodes.set(id, new WeakRef(element));
       }
       const state = formState(element);
       if (state !== null) {
@@ -438,6 +441,7 @@ export function mirrorRecorder(): void {
   const snapshot = (): Json => {
     styles.clear();
     controls.clear();
+    patchNodes.clear();
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
     lastFocus = focusedId();
@@ -541,6 +545,33 @@ export function mirrorRecorder(): void {
       if (!(element instanceof Element)) return false;
       element.scrollTo({ left, top, behavior: 'instant' });
       return true;
+    },
+    /**
+     * The pictured elements the window shows now: [id, x, y, width, height, dx, dy, tag] per element, its visible part
+     * in document CSS pixels (for Page.captureScreenshot's clip), and where that part starts in the element's box;
+     * with the window's size.
+     */
+    patches(): { view: [number, number]; list: Array<[number, number, number, number, number, number, number, string]> } {
+      const out: Array<[number, number, number, number, number, number, number, string]> = [];
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      for (const [id, ref] of patchNodes) {
+        const element = ref.deref();
+        if (!element || !element.isConnected) {
+          patchNodes.delete(id);
+          continue;
+        }
+        const box = element.getBoundingClientRect();
+        const left = Math.max(box.left, 0);
+        const top = Math.max(box.top, 0);
+        const right = Math.min(box.right, width);
+        const bottom = Math.min(box.bottom, height);
+        if (right - left < 2 || bottom - top < 2) continue;
+        if (!element.checkVisibility({ opacityProperty: true, visibilityProperty: true })) continue;
+        const r = (value: number) => Math.round(value * 100) / 100;
+        out.push([id, r(left + window.scrollX), r(top + window.scrollY), r(right - left), r(bottom - top), r(left - box.left), r(top - box.top), element.localName]);
+      }
+      return { view: [width, height], list: out };
     },
     /** The live node behind an id (the service maps the user's input with it). */
     node(id: number): Node | null {

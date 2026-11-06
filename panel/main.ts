@@ -33,6 +33,7 @@ const ICONS = {
   stop: 'M12 10.586l4.95-4.95 1.414 1.414-4.95 4.95 4.95 4.95-1.414 1.414-4.95-4.95-4.95 4.95-1.414-1.414 4.95-4.95-4.95-4.95L7.05 5.636z',
   add: 'M11 11V5h2v6h6v2h-6v6h-2v-6H5v-2z',
   external: 'M10 6v2H5v11h11v-5h2v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6zm11-3v8h-2V6.413l-7.793 7.794-1.414-1.414L17.585 5H13V3h8z',
+  picture: 'M2.992 21A.993.993 0 0 1 2 20.007V3.993A1 1 0 0 1 2.992 3h18.016c.548 0 .992.445.992.993v16.014a1 1 0 0 1-.992.993H2.992zM20 15V5H4v14L14 9l6 6zm0 2.828l-6-6L6.828 19H20v-1.172zM8 11a2 2 0 1 1 0-4 2 2 0 0 1 0 4z',
 } as const;
 
 const svg = (path: string, size = 16): SVGSVGElement => {
@@ -70,6 +71,10 @@ const view = new MirrorView(root, {
   onShown: (shown) => {
     pageShown = shown;
     if (state) paintPlaceholder(state);
+  },
+  onMode: (mode) => {
+    asPicture.node.setAttribute('aria-pressed', String(mode.picture));
+    asPicture.swap(ICONS.picture, mode.picture ? 'Show the page as HTML' : 'Show the page as a picture');
   },
 });
 const dialogBox = document.createElement('div');
@@ -222,6 +227,13 @@ if (input) {
 const status = document.createElement('span');
 status.className = 'status';
 toolbar.append(status);
+
+// The page as a picture (what Cloak Browser draws), or as HTML again: for a page HTML does not show well.
+const asPicture = iconButton(toolbar, 'Show the page as a picture', ICONS.picture, () => {
+  view.togglePicture();
+  releaseFocus();
+});
+asPicture.node.setAttribute('aria-pressed', 'false');
 
 // Opens the shown page in the user's own browser, a new tab there (the page's logins stay in Cloak Browser).
 const external = iconButton(toolbar, 'Open in your browser', ICONS.external, () => {

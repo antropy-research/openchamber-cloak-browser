@@ -16,6 +16,7 @@
 //
 // The panel is the parent; messages carry `cloak: true`:
 //   parent → frame  { type: 'events', doc, reset, messages }   { type: 'res', url, mime?, data? (base64) | text?, error? }
+//                   { type: 'patches', doc, patches: [{ id, mime, data, dx, dy, w, h }] }
 //   frame → parent  { type: 'ready' }  { type: 'want', urls }  { type: 'resync' }  { type: 'input', doc, events }
 import { startInput } from './frame-input.ts';
 
@@ -76,6 +77,13 @@ let pageAdopted = '';
 let shownDoc = 0;
 /** Elements scrolled in the page when it was described: scrolled here once the page is shown. */
 let scrolledAtStart: Array<[number, [number, number]]> = [];
+/**
+ * Pictures of the elements HTML cannot carry (a canvas, a video, another site's frame), for the document `patchDoc`:
+ * each stand-in shows its picture as its background, placed on the part of it the page's window showed.
+ */
+type PatchPicture = { url: string; dx: number; dy: number; w: number; h: number };
+const patchPictures = new Map<number, PatchPicture>();
+let patchDoc = -1;
 /** A change could not be applied: nothing more is, until the next snapshot (asked for with `resync`). */
 let broken = false;
 /** A snapshot waiting for its style sheets, and what came after it. */
@@ -86,6 +94,7 @@ const post = (message: Record<string, unknown>): void => parent.postMessage({ cl
 const input = startInput({
   idOf: (node) => ids.get(node),
   nodeOf: (id) => nodes.get(id),
+  patchAt: (x, y) => patchAt(x, y),
   send: (events) => post({ type: 'input', doc: shownDoc, events }),
 });
 
@@ -182,6 +191,50 @@ const applyResource = (element: Element, attribute: string, url: string): void =
   }
 };
 
+const paintPatch = (element: Element, picture: PatchPicture): void => {
+  if (!(element instanceof HTMLElement)) return;
+  const style = element.style;
+  style.setProperty('background-image', `url("${picture.url}")`, 'important');
+  style.setProperty('background-position', `${picture.dx}px ${picture.dy}px`, 'important');
+  style.setProperty('background-size', `${picture.w}px ${picture.h}px`, 'important');
+  style.setProperty('background-repeat', 'no-repeat', 'important');
+  style.setProperty('background-origin', 'border-box', 'important');
+  // A frame's own document would take the pointer: the input module finds the frame under it (patchAt).
+  if (element.localName === 'iframe') style.setProperty('pointer-events', 'none', 'important');
+};
+
+const forDoc = (doc: number): void => {
+  if (doc === patchDoc) return;
+  for (const picture of patchPictures.values()) URL.revokeObjectURL(picture.url);
+  patchPictures.clear();
+  patchDoc = doc;
+};
+
+const patchesArrived = (doc: number, patches: Array<{ id: number; mime: string; data: string; dx: number; dy: number; w: number; h: number }>): void => {
+  if (doc !== patchDoc) return;
+  for (const patch of patches) {
+    const bytes = Uint8Array.from(atob(patch.data), (char) => char.charCodeAt(0));
+    const old = patchPictures.get(patch.id);
+    const picture = { url: URL.createObjectURL(new Blob([bytes], { type: patch.mime })), dx: patch.dx, dy: patch.dy, w: patch.w, h: patch.h };
+    patchPictures.set(patch.id, picture);
+    const element = nodes.get(patch.id);
+    if (element instanceof Element) paintPatch(element, picture);
+    // The old picture goes once the new one is drawn.
+    if (old) setTimeout(() => URL.revokeObjectURL(old.url), 1000);
+  }
+};
+
+/** The stand-in (a frame) under a point, which takes no pointer events itself: the input module asks. */
+const patchAt = (x: number, y: number): Element | null => {
+  for (const id of patchPictures.keys()) {
+    const element = nodes.get(id);
+    if (!(element instanceof Element) || element.localName !== 'iframe') continue;
+    const box = element.getBoundingClientRect();
+    if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) return element;
+  }
+  return null;
+};
+
 const setAttribute = (element: Element, name: string, value: string | null): void => {
   // autofocus would take the keyboard from OpenChamber when a page shows (the page's own focus is the browser's).
   if (/^on/i.test(name) || name === 'srcdoc' || name === 'is' || name === 'autofocus') return;
@@ -202,6 +255,9 @@ const setAttribute = (element: Element, name: string, value: string | null): voi
     if (name === 'style') {
       styleAttributes.set(element, value);
       element.setAttribute('style', renderCss(value));
+      const id = ids.get(element);
+      const picture = id === undefined ? undefined : patchPictures.get(id);
+      if (picture) paintPatch(element, picture);
       return;
     }
     if (name === 'xlink:href') element.setAttributeNS(XLINK, name, value);
@@ -298,7 +354,8 @@ const build = (desc: Desc, parentNs: string | null): Node | null => {
   }
   register(desc.i, element);
   for (const [name, value] of Object.entries(desc.a ?? {})) {
-    if (desc.patch && (name === 'src' || name === 'data' || name === 'allow' || name === 'sandbox')) continue;
+    // The picture shows the page's own controls; the stand-in draws none of its own over them.
+    if (desc.patch && (name === 'src' || name === 'data' || name === 'allow' || name === 'sandbox' || (name === 'controls' && desc.n === 'video'))) continue;
     setAttribute(element, name, value);
   }
   if (desc.n === 'style' && desc.css !== undefined) {
@@ -400,12 +457,17 @@ const showSnapshot = (message: Snapshot, doc: number): void => {
   input.pageScrolled(0, message.scroll[0], message.scroll[1]);
   for (const [id, [left, top]] of scrolledAtStart) input.pageScrolled(id, left, top);
   scrolledAtStart = [];
+  for (const [id, picture] of patchPictures) {
+    const element = nodes.get(id);
+    if (element instanceof Element) paintPatch(element, picture);
+  }
   if (message.focus) input.pageFocused(message.focus);
 };
 
 /** A new page: shown once its style sheets are here, or after HOLD_MS; what comes for it meanwhile waits too. */
 const snapshot = (message: Snapshot, doc: number): void => {
   if (held) clearTimeout(held.timer);
+  forDoc(doc);
   const pending = linkedSheets(message.root);
   if (!pending.size) {
     held = null;
@@ -540,6 +602,8 @@ window.addEventListener('message', (event) => {
         else applyOps(ops);
       }
     }
+  } else if (data.type === 'patches' && Array.isArray((data as { patches?: unknown }).patches)) {
+    patchesArrived(data.doc ?? 0, (data as unknown as { patches: Array<{ id: number; mime: string; data: string; dx: number; dy: number; w: number; h: number }> }).patches);
   } else if (data.type === 'res' && data.url) {
     if ((data.data !== undefined || data.text !== undefined) && data.mime) resourceArrived(data.url, data.mime, data);
     else resourceFailed(data.url);

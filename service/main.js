@@ -1933,7 +1933,7 @@ class Browser {
 }
 
 // service/mirror.ts
-import { randomUUID } from "node:crypto";
+import { createHash as createHash2, randomUUID } from "node:crypto";
 
 // service/mirror-recorder.ts
 function mirrorRecorder() {
@@ -1951,6 +1951,7 @@ function mirrorRecorder() {
   const sent = new WeakSet;
   const detached = new WeakSet;
   const styles = new Map;
+  const patchNodes = new Map;
   const controls = new Map;
   let nextId = 1;
   let queue = [];
@@ -2084,6 +2085,7 @@ function mirrorRecorder() {
         delete attributes.src;
         delete attributes.srcdoc;
         delete attributes.data;
+        patchNodes.set(id, new WeakRef(element));
       }
       const state = formState(element);
       if (state !== null) {
@@ -2374,6 +2376,7 @@ function mirrorRecorder() {
   const snapshot = () => {
     styles.clear();
     controls.clear();
+    patchNodes.clear();
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
     lastFocus = focusedId();
@@ -2476,6 +2479,30 @@ function mirrorRecorder() {
       element.scrollTo({ left, top, behavior: "instant" });
       return true;
     },
+    patches() {
+      const out = [];
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      for (const [id, ref] of patchNodes) {
+        const element = ref.deref();
+        if (!element || !element.isConnected) {
+          patchNodes.delete(id);
+          continue;
+        }
+        const box = element.getBoundingClientRect();
+        const left = Math.max(box.left, 0);
+        const top = Math.max(box.top, 0);
+        const right = Math.min(box.right, width);
+        const bottom = Math.min(box.bottom, height);
+        if (right - left < 2 || bottom - top < 2)
+          continue;
+        if (!element.checkVisibility({ opacityProperty: true, visibilityProperty: true }))
+          continue;
+        const r = (value) => Math.round(value * 100) / 100;
+        out.push([id, r(left + window.scrollX), r(top + window.scrollY), r(right - left), r(bottom - top), r(left - box.left), r(top - box.top), element.localName]);
+      }
+      return { view: [width, height], list: out };
+    },
     node(id) {
       return byId.get(id)?.deref() ?? null;
     },
@@ -2496,6 +2523,11 @@ var LOG_BYTES_MAX = 6000000;
 var RESOURCES_BYTES_MAX = 5000000;
 var RESOURCE_BYTES_MAX = 4000000;
 var CACHE_BYTES_MAX = 150000000;
+var PATCH_SCAN_MS = 250;
+var PATCH_MOVING_MS = 250;
+var PATCH_STILL_MS = 1000;
+var PATCH_BYTES_MAX = 2000000;
+var PATCH_QUALITY = 75;
 var isText2 = (mime) => mime === "text/css" || mime === "image/svg+xml" || mime.startsWith("text/");
 var sleep3 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -2515,6 +2547,11 @@ class Mirror {
   cache = new Map;
   cacheBytes = 0;
   mimeTypes = new Map;
+  patches = new Map;
+  patchSeq = 0;
+  patchScanAt = 0;
+  coverage = 0;
+  patchesWantedAt = 0;
   constructor(browser) {
     this.browser = browser;
     browser.onShown((tab) => this.retarget(tab));
@@ -2531,28 +2568,51 @@ class Mirror {
   get watched() {
     return Date.now() - this.lastViewerAt < VIEWER_GONE_MS;
   }
-  async events(afterSeq, waitMs, run) {
-    const after = run === this.run ? afterSeq : 0;
+  async events(afterSeq, waitMs, run, patchAfterSeq = 0, picture = false) {
+    const known = run === this.run;
+    const after = known ? afterSeq : 0;
+    const patchAfter = known ? patchAfterSeq : 0;
     this.lastViewerAt = Date.now();
+    if (!picture)
+      this.patchesWantedAt = Date.now();
     this.browser.start().catch(() => {});
     if (!this.tab && this.browser.shown)
       this.retarget(this.browser.shown);
     this.kick();
-    const snapshotAt = this.log.find((entry) => entry.message.k === "snap")?.seq ?? Infinity;
-    if (after < snapshotAt && this.log.length === 0) {
+    const news = () => {
+      const snapshotAt = this.log.find((entry) => entry.message.k === "snap")?.seq ?? Infinity;
+      if (this.log.length && (after < snapshotAt || this.seq > after))
+        return true;
+      return after >= snapshotAt && this.patchSeq > patchAfter;
+    };
+    if (!news())
       await this.next(Math.min(Math.max(waitMs, 0), WAIT_MAX_MS));
-    } else if (after >= snapshotAt && this.seq <= after) {
-      await this.next(Math.min(Math.max(waitMs, 0), WAIT_MAX_MS));
-    }
     this.lastViewerAt = Date.now();
     const snapshot = this.log.findIndex((entry) => entry.message.k === "snap");
     const tab = this.tab?.id ?? null;
     if (snapshot === -1)
-      return { run: this.run, tab, doc: this.doc, from: this.seq + 1, seq: this.seq, reset: false, messages: [] };
+      return { run: this.run, tab, doc: this.doc, from: this.seq + 1, seq: this.seq, reset: false, messages: [], patches: [], patchSeq: patchAfter, coverage: this.coverage };
     const reset = after < this.log[snapshot].seq;
     const from = reset ? snapshot : this.log.findIndex((entry) => entry.seq > after);
     const messages = from === -1 ? [] : this.log.slice(from).map((entry) => entry.message);
-    return { run: this.run, tab, doc: this.doc, from: from === -1 ? this.seq + 1 : this.log[from].seq, seq: this.seq, reset, messages };
+    const { patches, patchSeq } = this.patchesAfter(reset ? 0 : patchAfter);
+    return { run: this.run, tab, doc: this.doc, from: from === -1 ? this.seq + 1 : this.log[from].seq, seq: this.seq, reset, messages, patches, patchSeq, coverage: this.coverage };
+  }
+  patchesAfter(after) {
+    const newer = [...this.patches.values()].filter((patch) => patch.seq > after).sort((a, b) => a.seq - b.seq);
+    const patches = [];
+    let bytes = 0;
+    let patchSeq = after;
+    for (const { hash: _hash, at: _at, ...patch } of newer) {
+      if (patches.length && bytes + patch.data.length > PATCH_BYTES_MAX)
+        break;
+      patches.push(patch);
+      bytes += patch.data.length;
+      patchSeq = patch.seq;
+    }
+    if (patches.length === newer.length)
+      patchSeq = Math.max(patchSeq, this.patchSeq);
+    return { patches, patchSeq };
   }
   get document() {
     return this.doc;
@@ -2607,6 +2667,8 @@ class Mirror {
     this.contextId = null;
     this.doc += 1;
     this.mimeTypes = new Map;
+    this.patches = new Map;
+    this.coverage = 0;
     this.log = [];
     this.logBytes = 0;
     this.wake();
@@ -2690,6 +2752,11 @@ class Mirror {
           await this.restart(tab);
         this.wake();
       }
+      if (doc === this.doc && Date.now() - this.patchScanAt >= PATCH_SCAN_MS) {
+        this.patchScanAt = Date.now();
+        if (await this.capturePatches(tab, doc))
+          this.wake();
+      }
       await sleep3(DRAIN_MS);
     }
     const tab = this.tab;
@@ -2697,6 +2764,37 @@ class Mirror {
       await this.browser.cdp.send("Runtime.evaluate", { expression: "globalThis.__cloakMirror && globalThis.__cloakMirror.stop()", contextId: this.contextId }, tab.sessionId, 3000).catch(() => {});
     }
     this.contextId = null;
+  }
+  async capturePatches(tab, doc) {
+    const cdp = this.browser.cdp;
+    const found = await this.call(doc, "patches()");
+    const list = Array.isArray(found?.list) ? found.list : [];
+    const area = found?.view ? found.view[0] * found.view[1] : 0;
+    const coverage = area > 0 ? Math.min(1, list.reduce((sum, entry) => sum + entry[3] * entry[4], 0) / area) : 0;
+    let changed = Math.abs(coverage - this.coverage) > 0.05;
+    this.coverage = Math.round(coverage * 100) / 100;
+    if (!cdp || !tab.sessionId || !list.length || Date.now() - this.patchesWantedAt > VIEWER_GONE_MS)
+      return changed;
+    for (const entry of list) {
+      const [id, x, y, w, h, dx, dy, tag] = entry;
+      const known = this.patches.get(id);
+      const every = tag === "canvas" || tag === "video" ? PATCH_MOVING_MS : PATCH_STILL_MS;
+      const moved = !known || known.dx !== dx || known.dy !== dy || known.w !== w || known.h !== h;
+      if (!moved && Date.now() - known.at < every)
+        continue;
+      const shot = await cdp.send("Page.captureScreenshot", { format: "jpeg", quality: PATCH_QUALITY, clip: { x, y, width: w, height: h, scale: 1 }, captureBeyondViewport: false }, tab.sessionId, 3000).catch(() => null);
+      if (!shot || doc !== this.doc)
+        return changed;
+      const hash = createHash2("sha1").update(shot.data).digest("base64");
+      if (known && !moved && known.hash === hash) {
+        known.at = Date.now();
+        continue;
+      }
+      this.patchSeq += 1;
+      this.patches.set(id, { id, seq: this.patchSeq, mime: "image/jpeg", data: shot.data, dx, dy, w, h, hash, at: Date.now() });
+      changed = true;
+    }
+    return changed;
   }
   async inject(tab) {
     const cdp = this.browser.cdp;
@@ -2899,10 +2997,10 @@ var applyMirrorInput = async (input, mirror, surface) => {
     switch (event.type) {
       case "pointer":
       case "wheel": {
-        const current = input.doc === mirror.document;
+        const current = input.doc === -1 || input.doc === mirror.document;
         if (!current && !(event.type === "pointer" && event.action === "up"))
           continue;
-        const placed = current ? await mirror.locate(input.doc, event.id, event.r, event.fx, event.fy) : null;
+        const placed = current && event.r !== -2 && input.doc !== -1 ? await mirror.locate(input.doc, event.id, event.r, event.fx, event.fy) : null;
         const [x, y] = placed ?? [event.x, event.y];
         if (event.type === "pointer") {
           batch.push({ type: "pointer", action: event.action, x, y, button: event.button, buttons: event.buttons, modifiers: event.modifiers });
@@ -3198,6 +3296,9 @@ class Surface {
       return "";
     const value = await this.browser.evaluate(shown.id, SELECTION_SCRIPT);
     return typeof value === "string" ? value : "";
+  }
+  get pageSize() {
+    return { width: this.cssWidth, height: this.cssHeight };
   }
   noteAgent() {
     this.agentUntil = Date.now() + 4000;
@@ -3645,7 +3746,26 @@ var route = async (req, res) => {
     case "GET /mirror/events": {
       const after = Number(url.searchParams.get("after")) || 0;
       const wait = Number(url.searchParams.get("wait")) || 0;
-      return send(res, 200, await mirror.events(after, wait, url.searchParams.get("run") ?? ""));
+      const patch = Number(url.searchParams.get("patch")) || 0;
+      return send(res, 200, await mirror.events(after, wait, url.searchParams.get("run") ?? "", patch, url.searchParams.get("mode") === "picture"));
+    }
+    case "GET /mirror/picture": {
+      const after = Number(url.searchParams.get("after")) || 0;
+      const wait = Math.min(15000, Number(url.searchParams.get("wait")) || 0);
+      const answer = await surface.frameAfter(after, wait);
+      if (!answer)
+        return send(res, 200, { seq: after });
+      const { width, height } = surface.pageSize;
+      return send(res, 200, {
+        seq: answer.seq,
+        mime: answer.frame.mime,
+        data: answer.frame.bytes.toString("base64"),
+        width: answer.frame.width,
+        height: answer.frame.height,
+        pageWidth: width,
+        pageHeight: height,
+        agentActive: answer.agentActive
+      });
     }
     case "POST /mirror/input": {
       const input = readMirrorInput(await readJson(req));
