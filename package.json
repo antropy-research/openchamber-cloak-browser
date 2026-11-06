@@ -1,6 +1,6 @@
 {
   "name": "@oc-forge/openchamber-cloak-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "CloakBrowser in OpenChamber: a browser on the server that you and the agent share.",
@@ -28,13 +28,16 @@
   },
   "scripts": {
     "check": "tsc -p .",
+    "test": "bun test tests/",
     "build": "bun run build:panel && bun run build:service",
     "build:panel": "openchamber-guest-bundle panel/main.ts panel/main.js",
     "build:service": "openchamber-guest-bundle --node service/main.ts service/main.js"
   },
   "devDependencies": {
     "@openchamber/sdk": "2.6.1",
+    "@types/bun": "^1.4.4",
     "@types/node": "^26.6.5",
+    "playwright-core": "1.63.0",
     "typescript": "^7.0.2"
   }
 }

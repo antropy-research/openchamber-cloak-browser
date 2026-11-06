@@ -1,13 +1,10 @@
-// The Cloak Browser service. OpenChamber starts it with its own Node, a loopback
-// port and a bearer token, and proxies two things to it: the panel's requests
-// (`host.serviceRequest`) and the shared surface, the picture in the panel and
-// the user's input on it. The contract is `GUEST_SERVICES.md` in
+// The Cloak Browser service. OpenChamber starts it with its own Node, a loopback port and a bearer token, and
+// proxies two things to it: the panel's requests (`host.serviceRequest`, the strip docked above the picture) and the
+// shared surface, the picture in the panel and the user's input on it. The contract is `GUEST_SERVICES.md` in
 // `@openchamber/sdk` ("Service process contract", "Shared surface").
-//
-// This skeleton answers that contract with a placeholder picture. CloakBrowser
-// comes next (README, Status).
 import http from 'node:http';
-import { deflateSync } from 'node:zlib';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   SURFACE_CLIPBOARD_PATH,
@@ -22,8 +19,10 @@ import {
   readSurfaceControlNotice,
   readSurfaceInputBatch,
   readSurfaceResizeRequest,
-  type SurfaceController,
 } from '@openchamber/sdk';
+
+import { Browser } from './browser.ts';
+import { Surface } from './surface.ts';
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
@@ -32,87 +31,23 @@ if (!port || !token) {
   process.exit(1);
 }
 
-/** Shown by OpenChamber above the picture and by the strip. ASCII: it travels in an HTTP header. */
-const TITLE = 'Cloak Browser: no browser yet (skeleton)';
-/** OpenChamber asks for a frame with `wait=25000`; a request is never held longer. */
-const FRAME_WAIT_MAX_MS = 25_000;
-/** The picture follows the panel's size, in device pixels, within these bounds. */
-const MIN_WIDTH = 200;
-const MIN_HEIGHT = 150;
-const MAX_WIDTH = 3840;
-const MAX_HEIGHT = 2400;
-
-const surface = {
-  /** Our own frame number; it starts at 1, so `after=0` asks for the current picture. */
-  seq: 1,
-  width: 1280,
-  height: 800,
-  controller: 'none' as SurfaceController,
-  picture: null as Buffer | null,
-  waiters: new Set<() => void>(),
-};
-
-/** A new picture: whoever waits for one gets it now. */
-const changed = (): void => {
-  surface.seq += 1;
-  surface.picture = null;
-  const waiters = [...surface.waiters];
-  surface.waiters.clear();
-  for (const wake of waiters) wake();
-};
-
-/** Resolves on the next picture or after `ms`, whichever comes first. */
-const nextPicture = (ms: number): Promise<void> => new Promise((resolve) => {
-  const wake = (): void => {
-    clearTimeout(timer);
-    surface.waiters.delete(wake);
-    resolve();
-  };
-  const timer = setTimeout(wake, ms);
-  surface.waiters.add(wake);
+const home = homedir();
+const browser = new Browser({
+  dataDir: process.env.OC_CLOAK_DATA_DIR ?? join(process.env.XDG_DATA_HOME ?? join(home, '.local/share'), 'oc-forge-cloak-browser'),
+  cacheDir: process.env.OC_CLOAK_CACHE_DIR ?? join(process.env.XDG_CACHE_HOME ?? join(home, '.cache'), 'oc-forge-cloak-browser'),
+  startUrl: process.env.OC_CLOAK_START_URL ?? 'https://www.google.com/',
+  onChange: () => surface.browserChanged(),
 });
+const surface = new Surface(browser);
 
-const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, n) => {
-  let c = n;
-  for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  return c >>> 0;
-});
-
-const crc32 = (bytes: Uint8Array): number => {
-  let crc = 0xffffffff;
-  for (const byte of bytes) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
+/** What the address field holds, as a URL: a scheme kept, a host given https (http for this machine), else a search. */
+const toUrl = (input: string): string => {
+  const text = input.trim();
+  if (/^[a-z][a-z0-9+.-]*:/i.test(text) && !/^[^/:]+:\d+(\/|$)/.test(text)) return text;
+  if (/^(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:\d+)?(\/|$)/i.test(text)) return `http://${text}`;
+  if (!/\s/.test(text) && /^[^/?#]+\.[a-z]{2,}(:\d+)?([/?#]|$)/i.test(text)) return `https://${text}`;
+  return `https://www.google.com/search?q=${encodeURIComponent(text)}`;
 };
-
-const pngChunk = (type: string, data: Buffer): Buffer => {
-  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
-  const chunk = Buffer.alloc(body.length + 8);
-  chunk.writeUInt32BE(data.length, 0);
-  body.copy(chunk, 4);
-  chunk.writeUInt32BE(crc32(body), body.length + 4);
-  return chunk;
-};
-
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-
-/** A fully transparent picture: the panel's own background shows through, in any theme. */
-const blankPicture = (width: number, height: number): Buffer => {
-  const header = Buffer.alloc(13);
-  header.writeUInt32BE(width, 0);
-  header.writeUInt32BE(height, 4);
-  header[8] = 8; // bits per channel
-  header[9] = 6; // RGBA
-  // Every row is a filter byte (0) and `width` transparent pixels: all zeros.
-  const rows = Buffer.alloc((width * 4 + 1) * height);
-  return Buffer.concat([
-    PNG_SIGNATURE,
-    pngChunk('IHDR', header),
-    pngChunk('IDAT', deflateSync(rows)),
-    pngChunk('IEND', Buffer.alloc(0)),
-  ]);
-};
-
-const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, Math.round(value)));
 
 const readBody = (req: http.IncomingMessage): Promise<string> => new Promise((resolve, reject) => {
   let body = '';
@@ -121,6 +56,15 @@ const readBody = (req: http.IncomingMessage): Promise<string> => new Promise((re
   req.on('end', () => resolve(body));
   req.on('error', reject);
 });
+
+const readJson = async (req: http.IncomingMessage): Promise<Record<string, unknown> | null> => {
+  try {
+    const value: unknown = JSON.parse(await readBody(req));
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+};
 
 const send = (res: http.ServerResponse, status: number, body?: unknown): void => {
   if (body === undefined) {
@@ -132,25 +76,14 @@ const send = (res: http.ServerResponse, status: number, body?: unknown): void =>
   res.end(JSON.stringify(body));
 };
 
-/** `GET /surface/frame?after=<seq>&wait=<ms>`: the picture once it is newer than `after`, else 204. */
-const sendFrame = async (res: http.ServerResponse, url: URL): Promise<void> => {
-  const after = Number(url.searchParams.get('after')) || 0;
-  const wait = clamp(Number(url.searchParams.get('wait')) || 0, 0, FRAME_WAIT_MAX_MS);
-  if (surface.seq <= after && wait > 0) await nextPicture(wait);
-  if (surface.seq <= after) {
-    send(res, 204);
-    return;
+/** A strip command: answered `{ ok }`, or `{ ok: false, error }` the strip shows. */
+const command = async (res: http.ServerResponse, run: () => Promise<void>): Promise<void> => {
+  try {
+    await run();
+    send(res, 200, { ok: true });
+  } catch (error) {
+    send(res, 200, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
-  surface.picture ??= blankPicture(surface.width, surface.height);
-  res.writeHead(200, {
-    'Content-Type': 'image/png',
-    'Content-Length': surface.picture.length,
-    [SURFACE_SEQ_HEADER]: String(surface.seq),
-    [SURFACE_WIDTH_HEADER]: String(surface.width),
-    [SURFACE_HEIGHT_HEADER]: String(surface.height),
-    [SURFACE_TITLE_HEADER]: TITLE,
-  });
-  res.end(surface.picture);
 };
 
 const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
@@ -159,13 +92,54 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
     case 'GET /health':
       return send(res, 200, { ok: true });
     case 'GET /state':
-      // What the strip shows.
-      return send(res, 200, { running: false, title: TITLE, controller: surface.controller });
-    case `GET ${SURFACE_FRAME_PATH}`:
-      return sendFrame(res, url);
-    case `POST ${SURFACE_INPUT_PATH}`:
-      // No page to drive yet: valid input is taken and dropped.
-      return send(res, readSurfaceInputBatch(await readBody(req)) ? 204 : 400);
+      void browser.start().catch(() => {});
+      await browser.refresh();
+      return send(res, 200, browser.state());
+    case 'POST /navigate': {
+      const body = await readJson(req);
+      const address = typeof body?.url === 'string' ? body.url.trim() : '';
+      if (!address) return send(res, 400, { ok: false, error: 'url is required' });
+      return command(res, () => browser.navigate(toUrl(address)));
+    }
+    case 'POST /history': {
+      const body = await readJson(req);
+      const direction = body?.direction === 'forward' ? 'forward' : 'back';
+      return command(res, () => browser.go(direction));
+    }
+    case 'POST /reload':
+      return command(res, () => browser.reload());
+    case 'POST /stop':
+      return command(res, () => browser.stopLoading());
+    case 'POST /viewer': {
+      const body = await readJson(req);
+      const dpr = typeof body?.dpr === 'number' && Number.isFinite(body.dpr) ? body.dpr : 1;
+      surface.viewer(dpr, body?.mac === true);
+      return send(res, 200, { ok: true });
+    }
+    case `GET ${SURFACE_FRAME_PATH}`: {
+      const answer = await surface.frameAfter(Number(url.searchParams.get('after')) || 0, Number(url.searchParams.get('wait')) || 0);
+      if (!answer) return send(res, 204);
+      res.writeHead(200, {
+        'Content-Type': answer.frame.mime,
+        'Content-Length': answer.frame.bytes.length,
+        [SURFACE_SEQ_HEADER]: String(answer.seq),
+        [SURFACE_WIDTH_HEADER]: String(answer.frame.width),
+        [SURFACE_HEIGHT_HEADER]: String(answer.frame.height),
+        [SURFACE_TITLE_HEADER]: answer.title,
+      });
+      res.end(answer.frame.bytes);
+      return;
+    }
+    case `POST ${SURFACE_INPUT_PATH}`: {
+      const batch = readSurfaceInputBatch(await readBody(req));
+      if (!batch) return send(res, 400);
+      try {
+        await surface.input(batch.events);
+        return send(res, 204);
+      } catch (error) {
+        return send(res, 503, { ok: false, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     case `POST ${SURFACE_CONTROL_PATH}`: {
       const notice = readSurfaceControlNotice(await readBody(req));
       if (!notice) return send(res, 400);
@@ -175,23 +149,16 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
     case `POST ${SURFACE_RESIZE_PATH}`: {
       const request = readSurfaceResizeRequest(await readBody(req));
       if (!request) return send(res, 400);
-      const width = clamp(request.width, MIN_WIDTH, MAX_WIDTH);
-      const height = clamp(request.height, MIN_HEIGHT, MAX_HEIGHT);
-      if (width !== surface.width || height !== surface.height) {
-        surface.width = width;
-        surface.height = height;
-        changed();
-      }
-      return send(res, 200, { width, height });
+      return send(res, 200, surface.resize(request.width, request.height));
     }
     case `GET ${SURFACE_CLIPBOARD_PATH}`:
-      return send(res, 200, { text: '' });
+      return send(res, 200, { text: await surface.clipboard().catch(() => '') });
     default:
       return send(res, 404, { ok: false, error: 'not-found' });
   }
 };
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     send(res, 401, { ok: false, error: 'unauthorized' });
     return;
@@ -201,4 +168,17 @@ http.createServer((req, res) => {
     if (res.headersSent) res.destroy();
     else send(res, 500, { ok: false, error: 'internal' });
   });
-}).listen(port, '127.0.0.1');
+});
+server.listen(port, '127.0.0.1');
+
+// OpenChamber stops a service with SIGTERM (then SIGKILL): the browser goes with it. One killed outright leaves its
+// browser behind, which the next start stops (browser.ts, stopLeftover).
+let stopping = false;
+const shutdown = (): void => {
+  if (stopping) return;
+  stopping = true;
+  server.close();
+  void browser.stop().finally(() => process.exit(0));
+};
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
