@@ -82,6 +82,9 @@ export class MirrorView {
    */
   private mine = false;
   private actedAt = 0;
+  /** Whether the panel is shown (main.ts, watchShown): while it is not, nothing is asked of the service. */
+  private active = true;
+  private readonly resumers = new Set<() => void>();
 
   constructor(parent: HTMLElement, options: MirrorViewOptions) {
     this.host = options.host;
@@ -123,6 +126,23 @@ export class MirrorView {
 
   stop(): void {
     this.stopped = true;
+  }
+
+  /** The panel was closed or shown again: the view stops asking the service meanwhile, and catches up after. */
+  setActive(active: boolean): void {
+    if (active === this.active) return;
+    this.active = active;
+    this.picture.setActive(active);
+    if (!active) return;
+    for (const resume of [...this.resumers]) resume();
+    this.resumers.clear();
+    this.sizeChanged(true);
+  }
+
+  /** Resolves once the panel is shown. */
+  private untilActive(): Promise<void> {
+    if (this.active) return Promise.resolve();
+    return new Promise((resolve) => this.resumers.add(resolve));
   }
 
   /** The keyboard to the page, as after Enter in the address field. */
@@ -202,6 +222,7 @@ export class MirrorView {
   private async poll(): Promise<void> {
     let failures = 0;
     while (!this.stopped) {
+      await this.untilActive();
       let answer: Answer;
       try {
         const query = new URLSearchParams({ after: String(this.after), wait: String(WAIT_MS), run: this.run, patch: String(this.patchAfter), ...(this.mode.picture ? { mode: 'picture' } : {}) });

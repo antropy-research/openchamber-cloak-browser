@@ -25,6 +25,8 @@ export class PictureView {
   private pendingMove: Record<string, unknown> | null = null;
   private moveTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly sentDown = new Set<string>();
+  private active = true;
+  private readonly resumers = new Set<() => void>();
 
   constructor(parent: HTMLElement, private readonly host: HostClient, private readonly send: (events: Array<Record<string, unknown>>) => void) {
     this.element = document.createElement('div');
@@ -62,9 +64,19 @@ export class PictureView {
     this.element.focus();
   }
 
+  /** The panel was closed or shown again: no pictures are asked for meanwhile. */
+  setActive(active: boolean): void {
+    this.active = active;
+    if (!active) return;
+    for (const resume of [...this.resumers]) resume();
+    this.resumers.clear();
+  }
+
   private async loop(): Promise<void> {
     let failures = 0;
     while (this.running) {
+      if (!this.active) await new Promise<void>((resolve) => this.resumers.add(resolve));
+      if (!this.running) return;
       try {
         const query = new URLSearchParams({ after: String(this.seq), wait: String(WAIT_MS) });
         const result = await this.host.serviceRequest({ method: 'GET', path: `/mirror/picture?${query}` });

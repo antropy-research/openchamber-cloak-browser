@@ -431,6 +431,41 @@ const refresh = async (): Promise<void> => {
   }
 };
 
+/**
+ * Whether the panel is shown. OpenChamber keeps an extension's page running when its panel is closed or another one
+ * is shown, and tells it neither: a closed zone keeps the page laid out at opacity 0, clipped to the narrow column
+ * the zone shrinks to, and another panel in the zone hides it. So the page counts as shown while nearly all of it is
+ * in view, and the browser tab is not hidden; not shown for SHOWN_SETTLE_MS (past the zone's animation), it stops
+ * asking the service, and the service then counts it as gone (no recorder, no pictures, no handover).
+ */
+const SHOWN_SETTLE_MS = 1500;
+let shown = true;
+let inView = true;
+let shownTimer: ReturnType<typeof setTimeout> | null = null;
+const shownChanged = (): void => {
+  const now = inView && document.visibilityState !== 'hidden';
+  if (shownTimer) clearTimeout(shownTimer);
+  shownTimer = null;
+  if (now) {
+    if (!shown) {
+      shown = true;
+      view.setActive(true);
+      void refresh();
+    }
+    return;
+  }
+  shownTimer = setTimeout(() => {
+    shownTimer = null;
+    shown = false;
+    view.setActive(false);
+  }, SHOWN_SETTLE_MS);
+};
+new IntersectionObserver((entries) => {
+  for (const entry of entries) inView = entry.intersectionRatio >= 0.95;
+  shownChanged();
+}, { threshold: [0, 0.95, 1] }).observe(root);
+document.addEventListener('visibilitychange', shownChanged);
+
 let started = false;
 host.onReady((context) => {
   applyHostReady(context, document.documentElement);
@@ -439,10 +474,14 @@ host.onReady((context) => {
   view.start();
   void refresh();
   // Fast while the user works in the page or something is moving (a download, a load), slow while the page
-  // sits still.
+  // sits still, not at all while the panel is not shown.
   const tick = (): void => {
     const moving = !state || state.phase !== 'running' || state.loading;
     setTimeout(() => {
+      if (!shown) {
+        tick();
+        return;
+      }
       void refresh().finally(tick);
     }, state?.inUse || state?.address ? 250 : moving ? 400 : 1000);
   };
