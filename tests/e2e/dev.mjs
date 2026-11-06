@@ -212,6 +212,61 @@ try {
   await page.waitForTimeout(800);
   await zone.screenshot({ path: join(out, '3-typed.png') });
 
+  // OpenChamber tells the service the panel's size only when the panel's box changes, over an open connection. A
+  // service started again (OpenChamber restarted, the extension updated) got no size, and the page was laid out at
+  // another one and scaled into the panel. The strip makes the panel tell it again (panel/main.ts, checkSize).
+  const sizes = () => pane.evaluate((element) => {
+    const picture = element.querySelector('canvas');
+    const box = element.getBoundingClientRect();
+    return { want: { w: Math.round(box.width * devicePixelRatio), h: Math.round(box.height * devicePixelRatio) }, have: { w: picture?.width ?? 0, h: picture?.height ?? 0 } };
+  });
+  const fits = (s) => Math.abs(s.want.w - s.have.w) <= 2 && Math.abs(s.want.h - s.have.h) <= 2;
+  const waitSizes = async (what, done, timeoutMs, onTick = async () => {}) => {
+    const end = Date.now() + timeoutMs;
+    let last = null;
+    while (Date.now() < end) {
+      await onTick();
+      last = await sizes();
+      if (done(last)) return last;
+      await page.waitForTimeout(250);
+    }
+    throw new Error(`${what}: ${JSON.stringify(last)}`);
+  };
+  /** The picture sized as another window would size it: also the size a service started again begins at. */
+  const otherWindowSize = async () => {
+    await context.request.post(`${base}/api/guests/${ID}/service/request`, { data: { method: 'POST', path: '/surface/resize', body: JSON.stringify({ width: 1280, height: 800 }) } });
+    return waitSizes('the other window\'s size', (s) => s.have.w === 1280 && s.have.h === 800, 10_000);
+  };
+  /** The service's process in the container (the pattern is split, so the scan does not find itself). */
+  const servicePid = () => execFileSync('docker', ['exec', CONTAINER, 'sh', '-c', 'a="cloak-browser/service/"; b="main.js"; for d in /proc/[0-9]*; do c=$(tr "\\0" " " < $d/cmdline 2>/dev/null) || continue; case "$c" in *node*"$a$b"*) echo ${d#/proc/};; esac; done'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean)[0] ?? '';
+  await step('the service starts again: the picture comes back at the panel\'s size', async () => {
+    await otherWindowSize();
+    const before = servicePid();
+    if (!before) throw new Error('no service process');
+    // `kill` is the shell's: the image has no kill program.
+    execFileSync('docker', ['exec', CONTAINER, 'sh', '-c', `kill -TERM ${Number(before)}`]);
+    // OpenChamber ends the picture's session with the service it lost and offers "Try again", which attaches to the
+    // next service: that one starts at the size it kept (the other window's), and OpenChamber sends it none.
+    const retry = page.getByRole('button', { name: 'Try again' });
+    let retried = false;
+    const back = await waitSizes('this panel\'s size', (s) => fits(s) && servicePid() !== before, 40_000, async () => {
+      if (!retried && await retry.isVisible().catch(() => false)) {
+        retried = true;
+        await retry.click().catch(() => {});
+      }
+    });
+    if (!(await serviceState()).surface?.sized) throw new Error('the service says no panel gave it its size');
+    return `service ${before} stopped, ${servicePid()} began at 1280×800${retried ? ' (Try again)' : ''}; now ${back.have.w}×${back.have.h}`;
+  });
+  await step('sized by another window: taking control gives the picture this window\'s size', async () => {
+    await header.getByRole('button', { name: 'Hand back to agent' }).click({ timeout: 2000 }).catch(() => {});
+    await otherWindowSize();
+    await canvas.click({ position: { x: 6, y: 6 } });
+    await header.getByText('You have control').waitFor({ timeout: 10_000 });
+    const back = await waitSizes('this window\'s size', fits, 15_000);
+    return `1280×800 → ${back.have.w}×${back.have.h}`;
+  });
+
   // AGENTS.md: Command-click (Control here) opens a new tab and leaves the view where it is.
   await step('Control-click on a link opens it in a tab behind; the picture stays', async () => {
     const before = await openPage('the link page', '<a href="https://example.com/" style="position:absolute;left:20px;top:20px;font:20px/24px sans-serif">open</a>', 'link');

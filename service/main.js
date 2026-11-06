@@ -179,6 +179,7 @@ var SURFACE_WIDTH_HEADER = "x-surface-width";
 var SURFACE_HEIGHT_HEADER = "x-surface-height";
 var SURFACE_TITLE_HEADER = "x-surface-title";
 var SURFACE_AGENT_ACTIVE_HEADER = "x-surface-agent-active";
+var SURFACE_VIEWER_CONTROLS_HEADER = "x-surface-viewer-controls";
 var SURFACE_INPUT_BATCH_MAX = 256;
 var SURFACE_TEXT_MAX = 64000;
 var SURFACE_TITLE_MAX = 200;
@@ -1245,6 +1246,7 @@ class Browser {
   starting = null;
   scale = 1;
   launchedScale = 0;
+  savedSize = null;
   backgroundUntil = 0;
   shownListeners = new Set;
   eventListeners = new Set;
@@ -1258,6 +1260,8 @@ class Browser {
       const saved = JSON.parse(readFileSync(join2(options.dataDir, "viewer.json"), "utf8"));
       if (typeof saved.scale === "number" && saved.scale >= 1 && saved.scale <= 4)
         this.scale = saved.scale;
+      if (Number.isInteger(saved.width) && Number.isInteger(saved.height))
+        this.savedSize = { width: saved.width, height: saved.height };
     } catch {}
   }
   get profile() {
@@ -1304,14 +1308,23 @@ class Browser {
     if (scale === this.scale)
       return;
     this.scale = scale;
-    await mkdir2(this.options.dataDir, { recursive: true });
-    await writeFile2(join2(this.options.dataDir, "viewer.json"), `${JSON.stringify({ scale })}
-`).catch(() => {});
+    await this.saveViewer();
     if (this.phase !== "running" || this.launchedScale === scale)
       return;
     await this.saveLastUrl();
     await this.stop();
     await this.start().catch(() => {});
+  }
+  async rememberSize(width, height) {
+    if (this.savedSize?.width === width && this.savedSize.height === height)
+      return;
+    this.savedSize = { width, height };
+    await this.saveViewer();
+  }
+  async saveViewer() {
+    await mkdir2(this.options.dataDir, { recursive: true }).catch(() => {});
+    await writeFile2(join2(this.options.dataDir, "viewer.json"), `${JSON.stringify({ scale: this.scale, ...this.savedSize })}
+`).catch(() => {});
   }
   start() {
     if (this.starting)
@@ -2077,9 +2090,18 @@ class Surface {
   swallowed = new Set;
   typing = null;
   typingSeq = 0;
+  sized = false;
   constructor(browser) {
     this.browser = browser;
     this.dpr = browser.scaleFactor;
+    const saved = browser.savedSize;
+    if (saved) {
+      this.deviceWidth = clamp(saved.width, MIN_WIDTH, MAX_WIDTH);
+      this.deviceHeight = clamp(saved.height, MIN_HEIGHT, MAX_HEIGHT);
+      this.cssWidth = Math.max(100, Math.round(this.deviceWidth / this.dpr));
+      this.cssHeight = Math.max(100, Math.round(this.deviceHeight / this.dpr));
+      browser.fillSize = { width: this.cssWidth, height: this.cssHeight };
+    }
     browser.onShown((tab) => this.recast(tab));
     browser.onCdpEvent((event) => this.onCdpEvent(event));
   }
@@ -2094,6 +2116,8 @@ class Surface {
   }
   resize(width, height) {
     const next = { width: clamp(width, MIN_WIDTH, MAX_WIDTH), height: clamp(height, MIN_HEIGHT, MAX_HEIGHT) };
+    this.sized = true;
+    this.browser.rememberSize(next.width, next.height);
     if (next.width !== this.deviceWidth || next.height !== this.deviceHeight) {
       this.deviceWidth = next.width;
       this.deviceHeight = next.height;
@@ -2144,7 +2168,11 @@ class Surface {
   stripState() {
     if (this.typing && Date.now() > this.typing.until)
       this.typing = null;
-    return { address: this.typing ? { seq: this.typing.seq } : null, inUse: Date.now() - this.inputAt < 3000 };
+    return {
+      address: this.typing ? { seq: this.typing.seq } : null,
+      inUse: Date.now() - this.inputAt < 3000,
+      surface: { width: this.deviceWidth, height: this.deviceHeight, maxWidth: MAX_WIDTH, sized: this.sized }
+    };
   }
   takeAddress(seq) {
     if (!this.typing || this.typing.seq !== seq)
@@ -2560,7 +2588,7 @@ var route = async (req, res) => {
     case "GET /state":
       browser.start().catch(() => {});
       await browser.refresh();
-      return send(res, 200, { ...browser.state(), ...surface.stripState() });
+      return send(res, 200, { ...browser.state(), ...surface.stripState(), youControl: req.headers[SURFACE_VIEWER_CONTROLS_HEADER] === "1" });
     case "POST /navigate": {
       const body = await readJson(req);
       const address = typeof body?.url === "string" ? body.url.trim() : "";

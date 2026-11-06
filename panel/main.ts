@@ -23,6 +23,10 @@ type State = {
   address: { seq: number } | null;
   /** The user is working in the picture: the strip looks more often, so a new tab or title shows at once. */
   inUse: boolean;
+  /** The picture's size in device pixels, and whether a panel has told this service run its size. */
+  surface?: { width: number; height: number; maxWidth: number; sized: boolean };
+  /** This window holds the picture (it took control). */
+  youControl?: boolean;
 };
 
 /** The dock's thickness (manifest `panel.size`), and with the dialog row. */
@@ -258,13 +262,73 @@ mountButton(dialogRow, { label: 'OK', variant: 'default', size: 'xs', onClick: (
 mountButton(dialogRow, { label: 'Cancel', variant: 'ghost', size: 'xs', onClick: () => answer(false) });
 const cancelNode = dialogRow.lastElementChild as HTMLButtonElement;
 
+/** The strip's height as it should be now: with the dialog row or without. */
+let baseHeight = HEIGHT;
+
+/**
+ * Makes OpenChamber tell the service the panel's size again. OpenChamber sends it only when the picture's box changes
+ * size, over an open connection, so a service started again (a restart of OpenChamber, an update) or a connection
+ * that opened late gets none, and the page is laid out at another size and scaled into the panel. A pixel more of
+ * strip and back changes the box twice; OpenChamber then sends the size it settles at, which is the panel's.
+ */
+let nudging = false;
+let lastNudgeAt = 0;
+const nudgeSize = async (): Promise<void> => {
+  if (nudging) return;
+  nudging = true;
+  lastNudgeAt = Date.now();
+  try {
+    await host.setHeight(baseHeight + 1);
+    // Past the dock's 200 ms transition, so the box really changed before it changes back.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await host.setHeight(baseHeight);
+  } catch {
+    // an older OpenChamber: the next look tries again
+  } finally {
+    nudging = false;
+  }
+};
+
+/**
+ * Whether the picture has this window's size, and the nudge when it has not: while no panel has given the service
+ * its size since it started (again and again, slower each time: the picture may wait for "Try again"), once after the
+ * strip loads when the width differs, and once each time this window takes control with another width (two windows
+ * at different sizes do not then take turns forever). The strip is as wide as the picture.
+ */
+const SIZE_SLACK = 2;
+const UNSIZED_WAITS_MS = [2000, 2000, 4000, 8000, 15_000];
+let unsizedNudges = 0;
+let checkedSince = false;
+let controlled = false;
+const checkSize = (next: State): void => {
+  const surface = next.surface;
+  if (!surface || next.phase !== 'running') return;
+  const wanted = Math.min(surface.maxWidth, Math.round(window.innerWidth * (window.devicePixelRatio || 1)));
+  const off = Math.abs(surface.width - wanted) > SIZE_SLACK;
+  const takesControl = next.youControl === true && !controlled;
+  controlled = next.youControl === true;
+  const now = Date.now();
+  if (!surface.sized) {
+    if (now - lastNudgeAt > UNSIZED_WAITS_MS[Math.min(unsizedNudges, UNSIZED_WAITS_MS.length - 1)]) {
+      unsizedNudges += 1;
+      void nudgeSize();
+    }
+    return;
+  }
+  unsizedNudges = 0;
+  const firstLook = !checkedSince;
+  checkedSince = true;
+  if (off && (firstLook || takesControl)) void nudgeSize();
+};
+
 let shownDialog = '';
 const paintDialog = (dialog: Dialog | null): void => {
   const key = JSON.stringify(dialog);
   if (key === shownDialog) return;
   shownDialog = key;
   dialogRow.hidden = !dialog;
-  void host.setHeight(dialog ? HEIGHT_WITH_DIALOG : HEIGHT).catch(() => {});
+  baseHeight = dialog ? HEIGHT_WITH_DIALOG : HEIGHT;
+  void host.setHeight(baseHeight).catch(() => {});
   if (!dialog) return;
   const kind = dialog.type === 'beforeunload' ? 'Leave this page?' : dialog.message;
   dialogMessage.textContent = kind;
@@ -334,6 +398,7 @@ const takeAddress = async (seq: number): Promise<void> => {
 
 const paint = (next: State): void => {
   state = next;
+  checkSize(next);
   if (next.address && next.address.seq !== takenAddress) void takeAddress(next.address.seq);
   paintTabs(next.tabs ?? []);
   paintDialog(next.dialog ?? null);

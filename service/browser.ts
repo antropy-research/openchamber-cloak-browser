@@ -130,6 +130,8 @@ export class Browser {
    */
   private scale = 1;
   private launchedScale = 0;
+  /** The picture's size in device pixels as the last window's panel asked for it, kept for the next start. */
+  savedSize: { width: number; height: number } | null = null;
   /** A click with Control (Command) or the middle button just landed: the tab it opens stays behind. */
   private backgroundUntil = 0;
   private readonly shownListeners = new Set<(tab: Tab) => void>();
@@ -142,8 +144,9 @@ export class Browser {
 
   constructor(private readonly options: BrowserOptions) {
     try {
-      const saved = JSON.parse(readFileSync(join(options.dataDir, 'viewer.json'), 'utf8')) as { scale?: unknown };
+      const saved = JSON.parse(readFileSync(join(options.dataDir, 'viewer.json'), 'utf8')) as { scale?: unknown; width?: unknown; height?: unknown };
       if (typeof saved.scale === 'number' && saved.scale >= 1 && saved.scale <= 4) this.scale = saved.scale;
+      if (Number.isInteger(saved.width) && Number.isInteger(saved.height)) this.savedSize = { width: saved.width as number, height: saved.height as number };
     } catch {
       // no window has reported one yet
     }
@@ -201,12 +204,23 @@ export class Browser {
   async setScale(scale: number): Promise<void> {
     if (scale === this.scale) return;
     this.scale = scale;
-    await mkdir(this.options.dataDir, { recursive: true });
-    await writeFile(join(this.options.dataDir, 'viewer.json'), `${JSON.stringify({ scale })}\n`).catch(() => {});
+    await this.saveViewer();
     if (this.phase !== 'running' || this.launchedScale === scale) return;
     await this.saveLastUrl();
     await this.stop();
     await this.start().catch(() => {});
+  }
+
+  /** The panel's size, kept with the pixel ratio: a service started again begins at it (Surface). */
+  async rememberSize(width: number, height: number): Promise<void> {
+    if (this.savedSize?.width === width && this.savedSize.height === height) return;
+    this.savedSize = { width, height };
+    await this.saveViewer();
+  }
+
+  private async saveViewer(): Promise<void> {
+    await mkdir(this.options.dataDir, { recursive: true }).catch(() => {});
+    await writeFile(join(this.options.dataDir, 'viewer.json'), `${JSON.stringify({ scale: this.scale, ...this.savedSize })}\n`).catch(() => {});
   }
 
   /** Running when it resolves; a failure is kept in `error` for the strip, and the next call tries again. */

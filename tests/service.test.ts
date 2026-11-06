@@ -685,3 +685,48 @@ describe('the browser\'s own keys, while the picture has the focus', () => {
     expect(await (await api(service, 'GET', '/surface/clipboard')).json()).toEqual({ text: 'beta' });
   }, 30_000);
 });
+
+describe('the panel\'s size, when OpenChamber does not send it', () => {
+  let dataDir: string;
+  let service: Service | null = null;
+  type Sized = State & { surface: { width: number; height: number; sized: boolean }; youControl: boolean };
+  const look = async (headers: Record<string, string> = {}): Promise<Sized> => {
+    const res = await fetch(`${service?.base}/state`, { headers: { authorization: `Bearer ${TOKEN}`, ...headers } });
+    return res.json() as Promise<Sized>;
+  };
+
+  beforeAll(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cloak-test-'));
+  });
+
+  afterAll(async () => {
+    if (service) await stopService(service);
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  // OpenChamber sends the size only when the panel's box changes, over an open connection: a service started again
+  // (a restart of OpenChamber, an update) gets none, and a page laid out at a default size was scaled into the panel.
+  test('a service started again begins at the last panel\'s size, and says no panel has given it one yet', async () => {
+    service = await startService(dataDir);
+    await api(service, 'POST', '/viewer', { dpr: 2, mac: false });
+    expect((await look()).surface.sized).toBe(false);
+    expect(await (await api(service, 'POST', '/surface/resize', { width: 1100, height: 700 })).json()).toEqual({ width: 1100, height: 700 });
+    await waitFor('the browser to run', () => look(), (s) => s.phase === 'running' && !s.loading, 60_000);
+    expect((await look()).surface).toMatchObject({ width: 1100, height: 700, sized: true });
+    await stopService(service);
+
+    service = await startService(dataDir);
+    expect((await look()).surface).toMatchObject({ width: 1100, height: 700, sized: false });
+    await waitFor('the browser to run again', () => look(), (s) => s.phase === 'running' && !s.loading, 60_000);
+    const first = await waitFor('a picture at that size', () => frame(service as Service, 0, 2000), (shown) => shown.status === 200 && shown.width === 1100);
+    expect(first.height).toBe(700);
+    await api(service, 'POST', '/surface/resize', { width: 1000, height: 600 });
+    expect((await look()).surface).toMatchObject({ width: 1000, height: 600, sized: true });
+  }, 120_000);
+
+  test('the strip learns whether its window holds the picture', async () => {
+    expect((await look({ 'x-surface-viewer-controls': '1' })).youControl).toBe(true);
+    expect((await look({ 'x-surface-viewer-controls': '0' })).youControl).toBe(false);
+    expect((await look()).youControl).toBe(false);
+  }, 30_000);
+});

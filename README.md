@@ -38,7 +38,11 @@ Works: the browser in the panel, and the agent's browser.
   panel opens and restarts after it exits; a browser left behind by a killed service is
   stopped on the next start.
 - **The picture.** The shown tab at the panel's size and the window's pixel ratio
-  (Retina is sharp), sent when the page changes.
+  (Retina is sharp), sent when the page changes. OpenChamber tells the service the
+  panel's size only when the panel changes size, so after a restart of OpenChamber or
+  the service it would not know it: the service keeps the last size, and the strip has
+  the panel tell it again (one pixel of strip and back) whenever the picture's width is
+  not the panel's.
 - **Input.** Click, double and triple click, drag, wheel, keys; on a Mac, Command acts
   as Control (the page is Chrome on Windows) and its line and word moves keep their
   meaning. Paste sends any text, Chinese included; copy hands the selection to your
@@ -86,7 +90,7 @@ Limits set by OpenChamber's viewer (2.6), which an extension cannot change:
 - The cursor keeps one shape, and the title above the picture is ASCII (an HTTP
   header); the strip shows the page's address.
 - One picture for every window: two windows with the panel open share it, at the size
-  of the one that last resized.
+  of the one that last resized or took control.
 
 ## How it runs
 

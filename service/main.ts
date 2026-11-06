@@ -17,6 +17,7 @@ import {
   SURFACE_RESIZE_PATH,
   SURFACE_SEQ_HEADER,
   SURFACE_TITLE_HEADER,
+  SURFACE_VIEWER_CONTROLS_HEADER,
   SURFACE_WIDTH_HEADER,
   readBrowserProviderRequest,
   readSurfaceControlNotice,
@@ -91,7 +92,8 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
     case 'GET /state':
       void browser.start().catch(() => {});
       await browser.refresh();
-      return send(res, 200, { ...browser.state(), ...surface.stripState() });
+      // The window the strip is in holds the picture (OpenChamber names it on a page's requests).
+      return send(res, 200, { ...browser.state(), ...surface.stripState(), youControl: req.headers[SURFACE_VIEWER_CONTROLS_HEADER] === '1' });
     case 'POST /navigate': {
       const body = await readJson(req);
       const address = typeof body?.url === 'string' ? body.url.trim() : '';

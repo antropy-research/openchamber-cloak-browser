@@ -171,8 +171,24 @@ export class Surface {
   private typing: { seq: number; draft: string; until: number } | null = null;
   private typingSeq = 0;
 
+  /**
+   * Whether a panel has told this process its size. OpenChamber sends the size when the panel's box changes, and only
+   * over an open connection: a service started again (a restart of OpenChamber, an update) or a connection that opened
+   * late gets none until the panel changes size. Until then the picture keeps the last size the service knew, and the
+   * strip, which sees this, makes the panel tell it again (panel/main.ts, checkSize).
+   */
+  private sized = false;
+
   constructor(private readonly browser: Browser) {
     this.dpr = browser.scaleFactor;
+    const saved = browser.savedSize;
+    if (saved) {
+      this.deviceWidth = clamp(saved.width, MIN_WIDTH, MAX_WIDTH);
+      this.deviceHeight = clamp(saved.height, MIN_HEIGHT, MAX_HEIGHT);
+      this.cssWidth = Math.max(100, Math.round(this.deviceWidth / this.dpr));
+      this.cssHeight = Math.max(100, Math.round(this.deviceHeight / this.dpr));
+      browser.fillSize = { width: this.cssWidth, height: this.cssHeight };
+    }
     browser.onShown((tab) => this.recast(tab));
     browser.onCdpEvent((event) => this.onCdpEvent(event));
   }
@@ -190,6 +206,8 @@ export class Surface {
   /** The panel's size in device pixels; answers the size the picture will have. */
   resize(width: number, height: number): { width: number; height: number } {
     const next = { width: clamp(width, MIN_WIDTH, MAX_WIDTH), height: clamp(height, MIN_HEIGHT, MAX_HEIGHT) };
+    this.sized = true;
+    void this.browser.rememberSize(next.width, next.height);
     if (next.width !== this.deviceWidth || next.height !== this.deviceHeight) {
       this.deviceWidth = next.width;
       this.deviceHeight = next.height;
@@ -242,10 +260,17 @@ export class Surface {
     }
   }
 
-  /** What the strip shows besides the browser's state: the address asked for, and whether the picture is in use. */
-  stripState(): { address: { seq: number } | null; inUse: boolean } {
+  /**
+   * What the strip shows besides the browser's state: the address asked for, whether the picture is in use, and the
+   * picture's size in device pixels with whether a panel has given it since this process started.
+   */
+  stripState(): { address: { seq: number } | null; inUse: boolean; surface: { width: number; height: number; maxWidth: number; sized: boolean } } {
     if (this.typing && Date.now() > this.typing.until) this.typing = null;
-    return { address: this.typing ? { seq: this.typing.seq } : null, inUse: Date.now() - this.inputAt < 3000 };
+    return {
+      address: this.typing ? { seq: this.typing.seq } : null,
+      inUse: Date.now() - this.inputAt < 3000,
+      surface: { width: this.deviceWidth, height: this.deviceHeight, maxWidth: MAX_WIDTH, sized: this.sized },
+    };
   }
 
   /** The strip's field has the focus: what was typed for it so far, and the keys go to the field from now on. */
