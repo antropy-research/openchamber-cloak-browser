@@ -267,16 +267,40 @@ const setAttribute = (element: Element, name: string, value: string | null): voi
   }
 };
 
-/** A control's value and state from the page. A field the user is typing in here keeps its own text (the page has
- * the same keys, and its echo would move the caret back); a box, a radio or a select takes the page's at once. */
+/** A field's text from the page; focused here, the caret stays where it was (at the end if it was there). */
+const setText = (element: HTMLInputElement | HTMLTextAreaElement, value: string): void => {
+  if (element.value === value) return;
+  const focusedHere = element === document.activeElement;
+  let start: number | null = null;
+  let end: number | null = null;
+  try {
+    start = element.selectionStart;
+    end = element.selectionEnd;
+  } catch {
+    // a field with no selection (a number)
+  }
+  const atEnd = end === element.value.length;
+  element.value = value;
+  if (!focusedHere || start === null || end === null) return;
+  try {
+    if (atEnd) element.setSelectionRange(value.length, value.length);
+    else element.setSelectionRange(Math.min(start, value.length), Math.min(end, value.length));
+  } catch {
+    // as above
+  }
+};
+
+/** A control's value and state from the page. A field the user is typing in here keeps its own text meanwhile (the
+ * page has the same keys, and its echo would move the caret back); a box, a radio or a select takes the page's at
+ * once, and so does a field the page or the agent writes in while the user is not typing. */
 const applyForm = (element: Element, state: Desc['p']): void => {
   if (!state) return;
-  const typing = element === document.activeElement && (element instanceof HTMLTextAreaElement || (element instanceof HTMLInputElement && !/^(checkbox|radio|button|submit|reset|file|image|range|color)$/i.test(element.type)));
+  const typing = element === document.activeElement && input.typing() && (element instanceof HTMLTextAreaElement || (element instanceof HTMLInputElement && !/^(checkbox|radio|button|submit|reset|file|image|range|color)$/i.test(element.type)));
   if (element instanceof HTMLInputElement) {
-    if (state.v !== undefined && element.type !== 'file' && !typing) element.value = state.v;
+    if (state.v !== undefined && element.type !== 'file' && !typing) setText(element, state.v);
     if (state.k !== undefined) element.checked = state.k;
   } else if (element instanceof HTMLTextAreaElement) {
-    if (state.v !== undefined && !typing) element.value = state.v;
+    if (state.v !== undefined && !typing) setText(element, state.v);
   } else if (element instanceof HTMLSelectElement) {
     if (state.si !== undefined) element.selectedIndex = state.si;
   }

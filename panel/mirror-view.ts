@@ -270,6 +270,8 @@ export class MirrorView {
     const last = this.inputQueue.at(-1);
     const isMove = (events: unknown[]) => events.length === 1 && (events[0] as { type?: string; action?: string }).type === 'pointer' && (events[0] as { action?: string }).action === 'move';
     if (!isMove(batch.events)) {
+      // Taking control: the page is laid out at this window's size again (another window may have sized it since).
+      if (!this.mine) this.sizeChanged(true);
       this.mine = true;
       this.actedAt = Date.now();
     } else if (!this.mine) {

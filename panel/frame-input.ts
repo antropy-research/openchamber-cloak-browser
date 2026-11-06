@@ -40,6 +40,8 @@ const WHEEL_SCROLL_MS = 250;
 const KEY_SCROLL_MS = 800;
 /** The page's focus does not move the frame's for this long after the user put it somewhere. */
 const FOCUS_HOLD_MS = 400;
+/** After a key, the field the user types in keeps its own text this long (the page's echo comes meanwhile). */
+const TYPING_MS = 1500;
 
 const editable = (element: Element | null): boolean => {
   if (!element) return false;
@@ -269,6 +271,10 @@ export const startInput = (hooks: InputHooks) => {
   });
 
   return {
+    /** The user is typing here (a key in the last moments, or a composition): a field keeps its own text. */
+    typing(): boolean {
+      return composing || Date.now() - lastKeyAt < TYPING_MS;
+    },
     /** A new page: what was known of the old one's scrolling goes. */
     reset(): void {
       pagePos.clear();
