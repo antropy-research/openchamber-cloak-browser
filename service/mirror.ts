@@ -47,6 +47,10 @@ const SNAPSHOT_BYTES_MAX = 5_000_000;
 const INLINE_CSS_BYTES_MAX = 2_000_000;
 /** A sheet the page is still loading is waited for this long (a browser does not paint before its sheets either). */
 const INLINE_CSS_WAIT_MS = 2000;
+/** A resource a panel asks for that the page is still loading: waited for this long before the network is asked. */
+const RESOURCE_WAIT_MS = 1500;
+/** Resources of one request fetched at once. */
+const RESOURCE_FETCHES = 6;
 /** Patches in one answer, base64 included: the rest come with the next. */
 const PATCH_BYTES_MAX = 2_000_000;
 const PATCH_QUALITY = 75;
@@ -307,24 +311,29 @@ export class Mirror {
     const resources: Record<string, Delivered | { error: string }> = {};
     const later: string[] = [];
     let bytes = 0;
-    for (const url of urls) {
-      if (bytes > RESOURCES_BYTES_MAX) {
-        later.push(url);
-        continue;
+    // A few at a time: one the page is still loading may be waited for (resource), and the rest go on meanwhile.
+    const queue = [...urls];
+    const worker = async (): Promise<void> => {
+      for (let url = queue.shift(); url !== undefined; url = queue.shift()) {
+        if (bytes > RESOURCES_BYTES_MAX) {
+          later.push(url);
+          continue;
+        }
+        const resource = await this.resource(url).catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }));
+        if (!resource) {
+          resources[url] = { error: 'not found' };
+          continue;
+        }
+        if ('error' in resource) {
+          resources[url] = resource;
+          continue;
+        }
+        resources[url] = isText(resource.mime) ? { mime: resource.mime, text: Buffer.from(resource.data, 'base64').toString('utf8') } : resource;
+        if (resource.mime === 'text/css') this.sheetsSent.add(url);
+        bytes += resource.data.length;
       }
-      const resource = await this.resource(url).catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) }));
-      if (!resource) {
-        resources[url] = { error: 'not found' };
-        continue;
-      }
-      if ('error' in resource) {
-        resources[url] = resource;
-        continue;
-      }
-      resources[url] = isText(resource.mime) ? { mime: resource.mime, text: Buffer.from(resource.data, 'base64').toString('utf8') } : resource;
-      if (resource.mime === 'text/css') this.sheetsSent.add(url);
-      bytes += resource.data.length;
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(RESOURCE_FETCHES, urls.length) }, worker));
     return { resources, later };
   }
 
@@ -564,7 +573,9 @@ export class Mirror {
 
   /**
    * A resource as the page has it, waiting until `until` while the page still loads it; null then. Never fetched
-   * again over the network (the page is fetching it already).
+   * again over the network (the page is fetching it already). Taken only once the page's load of it is done (the
+   * recorder's `loaded`): the browser's copy of a resource still loading is the part that has come, and a part kept
+   * here and in the panel would stay for the session (a large sheet cut in two, the page's layout with it).
    */
   private async loadedResource(url: string, until: number): Promise<Resource | null> {
     for (;;) {
@@ -573,6 +584,12 @@ export class Mirror {
       const tab = this.tab;
       const cdp = this.browser.cdp;
       if (!tab?.sessionId || !cdp) return null;
+      const whole = (await this.call(this.doc, `loaded(${JSON.stringify(url)})`)) === true;
+      if (!whole) {
+        if (Date.now() >= until) return null;
+        await sleep(100);
+        continue;
+      }
       try {
         const { frameTree } = await cdp.send<{ frameTree: { frame: { id: string } } }>('Page.getFrameTree', {}, tab.sessionId);
         const answer = await cdp.send<{ content: string; base64Encoded: boolean }>('Page.getResourceContent', { frameId: frameTree.frame.id, url }, tab.sessionId, 3000);
@@ -596,25 +613,18 @@ export class Mirror {
       this.cache.set(url, cached);
       return cached;
     }
+    // The page's copy, once it has it whole: the page may be loading it now (a sheet its script added after the
+    // snapshot, an image coming into view), and a second fetch would cost the site a second request.
+    const loading = await this.loadedResource(url, Date.now() + RESOURCE_WAIT_MS).catch(() => null);
+    if (loading) return loading;
     const tab = this.tab ?? this.browser.shown;
     const cdp = this.browser.cdp;
     if (!tab || !cdp) return null;
     const session = await this.browser.sessionOf(tab);
     const { frameTree } = await cdp.send<{ frameTree: { frame: { id: string } } }>('Page.getFrameTree', {}, session);
     const frameId = frameTree.frame.id;
-    // What the page already loaded, from the browser's memory.
-    try {
-      const answer = await cdp.send<{ content: string; base64Encoded: boolean }>('Page.getResourceContent', { frameId, url }, session, 8000);
-      const data = answer.base64Encoded ? answer.content : Buffer.from(answer.content, 'utf8').toString('base64');
-      if (data.length <= RESOURCE_BYTES_MAX * 1.4) {
-        const resource = absoluteCss(url, { mime: await this.mimeOf(frameId, url, session), data });
-        this.remember(url, resource);
-        return resource;
-      }
-    } catch {
-      // not among the page's resources
-    }
-    // Through the browser's network, with the page's cookies and its fingerprint.
+    // Not among what the page has loaded whole: through the browser's network, with the page's cookies and its
+    // fingerprint.
     const loaded = await cdp.send<{ resource: { success: boolean; stream?: string; headers?: Record<string, string>; httpStatusCode?: number } }>(
       'Network.loadNetworkResource',
       { frameId, url, options: { disableCache: false, includeCredentials: true } },

@@ -52,6 +52,12 @@ Works: the browser in the panel, and the agent's browser.
   old one until its style sheets are here. No script of the page's ever runs in the panel:
   no script element in any namespace, no event handler, no `javascript:` value, no
   `srcdoc`, no `autofocus`.
+- **The page's layout.** The content is laid out in the page's own width (a scroll bar
+  takes 15 px of the browser's window and may take none of yours), an image the panel has
+  not fetched yet keeps its own size, a style sheet comes whole (the browser's copy is
+  taken once the page has loaded all of it, and never fetched a second time while the page
+  is still loading it), sheets the page's script adds or turns on later come too, and
+  custom elements are `:defined` in the panel exactly when the page has defined them.
 - **Pictures for what HTML cannot carry.** A canvas, a video, another site's frame, an
   embed: the part the window shows is captured in the page and painted on its stand-in, a
   few times a second for a canvas or a video and once a second for the rest, sent only when
@@ -127,12 +133,17 @@ the picture the extension sent before (JPEG 80, ratio 2, 1000×700):
 A first view costs more than one picture (style sheets, fonts, images), and those come
 once per site: what follows is changes.
 
+Where the panel puts things against the page (the tops of the first headings, paragraphs
+or rows, `tests/e2e/mirror-drift.mjs`): Wikipedia 3 px apart in the median, 5 at most;
+GitHub 5 and 38; Hacker News 6 and 6; example.com 26 and 26. What is left is text drawn
+with other fonts (Limits): when Wikipedia shows its fundraising banner (to some first
+visits), the banner's paragraphs take more lines in the panel, and the article sits 249 px
+lower.
+
 Next:
 
-1. Both ends are Chromium: send less (no style sheets the panel can take as they are,
-   input by position), falling back to this where the window's browser is not.
-2. File pickers, downloads, date and color pickers (type the value meanwhile).
-3. A CloakBrowser key for the newest build (the free build is Chromium 146).
+1. File pickers, downloads, date and color pickers (type the value meanwhile).
+2. A CloakBrowser key for the newest build (the free build is Chromium 146).
 
 Limits:
 
@@ -141,6 +152,11 @@ Limits:
 - The panel's frame may load nothing from the network (OpenChamber's policy for
   extension pages): what a page loads is fetched through the service, a little later
   than the page has it.
+- Text is drawn with the fonts of the machine your window runs on. Where they differ from
+  the browser's (oc-forge's image has Liberation and Noto), a line can break elsewhere and
+  what follows it moves: on example.com, 26 px by the end. Giving a Chromium window the
+  browser's own font files does not help (the same files lay out differently on another
+  machine: hinting, glyph advances); branch `html-mirror-chromium` has the attempt.
 
 ## How it runs
 
@@ -195,9 +211,11 @@ through the routes OpenChamber and the panel use.
 CloakBrowser (not in CI; each says how to run it): `dev.mjs` (the whole of it, the
 agent's browser and with `--agent` a real agent), and `mirror-input`, `mirror-patches`,
 `mirror-control`, `mirror-watchdog`, `mirror-hidden`, `mirror-safety` (a page that
-tries to run code in the panel) and `mirror-sites` (the table above). `--temp` (the default for the `mirror-*` ones) installs this checkout's build
-as a temporary extension with its own id and data, so the Cloak Browser dev runs is
-untouched.
+tries to run code in the panel), `mirror-layout` (a page that moves its layout without
+changing its text), `mirror-sites` (the cost table above) and `mirror-drift` (where things
+sit on real sites). `--temp` (the default for the `mirror-*` ones) installs this
+checkout's build as a temporary extension with its own id and data, so the Cloak Browser
+dev runs is untouched.
 
 To try it elsewhere, add the folder in OpenChamber's Settings → Extensions, allow its
 local service, and open Cloak Browser in the rail. For the agent, pick Cloak Browser

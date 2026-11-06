@@ -2227,6 +2227,19 @@ function mirrorRecorder() {
   const SKIP = new Set(["script", "noscript", "template", "base", "meta"]);
   const PATCH = new Set(["canvas", "video", "iframe", "embed", "object", "audio"]);
   const URL_ATTRIBUTES = new Set(["src", "href", "poster", "action", "formaction", "data", "background", "cite", "xlink:href"]);
+  const finished = new Set;
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries())
+        finished.add(entry.name);
+      if (finished.size > 20000) {
+        const newest = Array.from(finished).slice(-1e4);
+        finished.clear();
+        for (const name of newest)
+          finished.add(name);
+      }
+    }).observe({ type: "resource", buffered: true });
+  } catch {}
   const ids = new WeakMap;
   const byId = new Map;
   const sent = new WeakSet;
@@ -2323,8 +2336,19 @@ function mirrorRecorder() {
     return element.namespaceURI === HTML && element.localName === "link" && !isStylesheet(element);
   };
   let observer;
+  const unsized = new Map;
+  const sizeImage = (id, image, out) => {
+    if (image.hasAttribute("width") && image.hasAttribute("height"))
+      return;
+    if (image.naturalWidth > 0 && image.naturalHeight > 0)
+      out.is = [image.naturalWidth, image.naturalHeight];
+    else
+      unsized.set(id, new WeakRef(image));
+  };
   const observedShadows = new WeakSet;
   const shadowless = new Set;
+  const definedNames = new Set;
+  const undefinedCustom = new Map;
   let described = 0;
   let lastFullShadowSweep = 0;
   const serialize = (node, parentNs) => {
@@ -2341,6 +2365,14 @@ function mirrorRecorder() {
     const ns = element.namespaceURI === SVG ? "s" : element.namespaceURI === MATH ? "m" : null;
     if (ns !== parentNs)
       out.ns = ns ?? "h";
+    if (element.namespaceURI === HTML && tag.includes("-")) {
+      if (definedNames.has(tag) || element.matches(":defined")) {
+        definedNames.add(tag);
+        out.d = 1;
+      } else {
+        undefinedCustom.set(id, new WeakRef(element));
+      }
+    }
     const attributes = attributesOf(element);
     if (element.namespaceURI === HTML) {
       if (tag === "style") {
@@ -2355,6 +2387,7 @@ function mirrorRecorder() {
         return out;
       }
       if (tag === "img") {
+        sizeImage(id, element, out);
         const image = element;
         const chosen = image.currentSrc || image.getAttribute("src") || "";
         delete attributes.srcset;
@@ -2463,6 +2496,10 @@ function mirrorRecorder() {
           parents.add(record.target);
       } else if (record.type === "attributes") {
         const element = record.target;
+        if (record.attributeName === "rel" && element.localName === "link" && element.parentNode && !sent.has(element)) {
+          parents.add(element.parentNode);
+          continue;
+        }
         let names = attributes.get(element);
         if (!names)
           attributes.set(element, names = new Set);
@@ -2583,6 +2620,32 @@ function mirrorRecorder() {
       adopted = nextAdopted;
       ops.push(["A", adopted]);
     }
+    for (const [id, ref] of unsized) {
+      const image = ref.deref();
+      if (!image || !image.isConnected) {
+        unsized.delete(id);
+        continue;
+      }
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        unsized.delete(id);
+        ops.push(["n", id, image.naturalWidth, image.naturalHeight]);
+      }
+    }
+    for (const [id, ref] of undefinedCustom) {
+      const element = ref.deref();
+      if (!element || !element.isConnected) {
+        undefinedCustom.delete(id);
+        continue;
+      }
+      const name = element.localName;
+      if (!definedNames.has(name) && !element.matches(":defined"))
+        continue;
+      undefinedCustom.delete(id);
+      if (definedNames.has(name))
+        continue;
+      definedNames.add(name);
+      ops.push(["d", id]);
+    }
     const width = document.documentElement.clientWidth;
     if (width !== layoutWidth) {
       layoutWidth = width;
@@ -2686,6 +2749,9 @@ function mirrorRecorder() {
     styles.clear();
     controls.clear();
     patchNodes.clear();
+    unsized.clear();
+    definedNames.clear();
+    undefinedCustom.clear();
     shadowless.clear();
     described = 0;
     adopted = adoptedText(document.adoptedStyleSheets);
@@ -2845,6 +2911,17 @@ function mirrorRecorder() {
     fontProbe(index) {
       return fontProbes[index] ?? null;
     },
+    loaded(url) {
+      if (finished.has(url) || performance.getEntriesByName(url).length > 0)
+        return true;
+      for (const sheet of Array.from(document.styleSheets))
+        if (sheet.href === url)
+          return true;
+      for (const image of Array.from(document.images))
+        if (image.currentSrc === url && image.complete && image.naturalWidth > 0)
+          return true;
+      return false;
+    },
     rects(selector) {
       return Array.from(document.querySelectorAll(selector)).slice(0, 200).map((element) => {
         const box = element.getBoundingClientRect();
@@ -2878,6 +2955,8 @@ var PATCH_STILL_MS = 1000;
 var SNAPSHOT_BYTES_MAX = 5000000;
 var INLINE_CSS_BYTES_MAX = 2000000;
 var INLINE_CSS_WAIT_MS = 2000;
+var RESOURCE_WAIT_MS = 1500;
+var RESOURCE_FETCHES = 6;
 var PATCH_BYTES_MAX = 2000000;
 var PATCH_QUALITY = 75;
 var FONT_PLAN_MS = 3000;
@@ -3069,25 +3148,29 @@ class Mirror {
     const resources = {};
     const later = [];
     let bytes = 0;
-    for (const url of urls) {
-      if (bytes > RESOURCES_BYTES_MAX) {
-        later.push(url);
-        continue;
+    const queue = [...urls];
+    const worker = async () => {
+      for (let url = queue.shift();url !== undefined; url = queue.shift()) {
+        if (bytes > RESOURCES_BYTES_MAX) {
+          later.push(url);
+          continue;
+        }
+        const resource = await this.resource(url).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+        if (!resource) {
+          resources[url] = { error: "not found" };
+          continue;
+        }
+        if ("error" in resource) {
+          resources[url] = resource;
+          continue;
+        }
+        resources[url] = isText2(resource.mime) ? { mime: resource.mime, text: Buffer.from(resource.data, "base64").toString("utf8") } : resource;
+        if (resource.mime === "text/css")
+          this.sheetsSent.add(url);
+        bytes += resource.data.length;
       }
-      const resource = await this.resource(url).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
-      if (!resource) {
-        resources[url] = { error: "not found" };
-        continue;
-      }
-      if ("error" in resource) {
-        resources[url] = resource;
-        continue;
-      }
-      resources[url] = isText2(resource.mime) ? { mime: resource.mime, text: Buffer.from(resource.data, "base64").toString("utf8") } : resource;
-      if (resource.mime === "text/css")
-        this.sheetsSent.add(url);
-      bytes += resource.data.length;
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(RESOURCE_FETCHES, urls.length) }, worker));
     return { resources, later };
   }
   async release() {
@@ -3315,6 +3398,13 @@ globalThis.__cloakMirror.start();`, contextId: executionContextId }, session, 1e
       const cdp = this.browser.cdp;
       if (!tab?.sessionId || !cdp)
         return null;
+      const whole = await this.call(this.doc, `loaded(${JSON.stringify(url)})`) === true;
+      if (!whole) {
+        if (Date.now() >= until)
+          return null;
+        await sleep3(100);
+        continue;
+      }
       try {
         const { frameTree } = await cdp.send("Page.getFrameTree", {}, tab.sessionId);
         const answer = await cdp.send("Page.getResourceContent", { frameId: frameTree.frame.id, url }, tab.sessionId, 3000);
@@ -3337,6 +3427,9 @@ globalThis.__cloakMirror.start();`, contextId: executionContextId }, session, 1e
       this.cache.set(url, cached);
       return cached;
     }
+    const loading = await this.loadedResource(url, Date.now() + RESOURCE_WAIT_MS).catch(() => null);
+    if (loading)
+      return loading;
     const tab = this.tab ?? this.browser.shown;
     const cdp = this.browser.cdp;
     if (!tab || !cdp)
@@ -3344,15 +3437,6 @@ globalThis.__cloakMirror.start();`, contextId: executionContextId }, session, 1e
     const session = await this.browser.sessionOf(tab);
     const { frameTree } = await cdp.send("Page.getFrameTree", {}, session);
     const frameId = frameTree.frame.id;
-    try {
-      const answer = await cdp.send("Page.getResourceContent", { frameId, url }, session, 8000);
-      const data = answer.base64Encoded ? answer.content : Buffer.from(answer.content, "utf8").toString("base64");
-      if (data.length <= RESOURCE_BYTES_MAX * 1.4) {
-        const resource = absoluteCss(url, { mime: await this.mimeOf(frameId, url, session), data });
-        this.remember(url, resource);
-        return resource;
-      }
-    } catch {}
     const loaded = await cdp.send("Network.loadNetworkResource", { frameId, url, options: { disableCache: false, includeCredentials: true } }, session, 15000);
     if (!loaded.resource.success || !loaded.resource.stream)
       return null;
