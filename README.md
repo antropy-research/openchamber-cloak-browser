@@ -91,12 +91,15 @@ Works: the browser in the panel, and the agent's browser.
   looking: it goes to the page only while you hold control), another window sees
   *Another device has control* and cannot take it, and the agent's actions are refused
   with OpenChamber's own message while you hold it. *Hand back to agent* gives it back;
-  so does a minute without input, or closing the window.
+  so does a minute without input, or closing the window. The strip says you hold control
+  only with an agent around (it acted or tried to in the last ten minutes): to someone
+  just browsing it means nothing.
 - **The browser outlives its service.** OpenChamber stops a browser provider's service
   ten minutes after the agent's last action, whoever is browsing. Stopped while a panel
   is shown, the service leaves the browser running and the next one, which the panel's
   next request starts, takes it over: tabs, pages, what you typed. Nobody takes it within
-  a minute (the extension was paused or removed): a watchdog stops it.
+  a minute (the extension was paused or removed), or its handover is gone: a watchdog
+  stops it.
 - **A panel that is not shown** (closed, or another panel in its place) asks the service
   for nothing, and catches up when shown again. OpenChamber does not tell a page when its
   panel is closed: the panel counts as shown while nearly all of it is in view.
@@ -191,8 +194,8 @@ through the routes OpenChamber and the panel use.
 `tests/e2e/` holds the journeys through oc-forge's dev OpenChamber with the real
 CloakBrowser (not in CI; each says how to run it): `dev.mjs` (the whole of it, the
 agent's browser and with `--agent` a real agent), and `mirror-input`, `mirror-patches`,
-`mirror-control`, `mirror-watchdog`, `mirror-hidden` and `mirror-sites` (the table
-above). `--temp` (the default for the `mirror-*` ones) installs this checkout's build
+`mirror-control`, `mirror-watchdog`, `mirror-hidden`, `mirror-safety` (a page that
+tries to run code in the panel) and `mirror-sites` (the table above). `--temp` (the default for the `mirror-*` ones) installs this checkout's build
 as a temporary extension with its own id and data, so the Cloak Browser dev runs is
 untouched.
 
