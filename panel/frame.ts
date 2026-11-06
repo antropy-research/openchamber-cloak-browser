@@ -20,7 +20,7 @@
 //                   { type: 'fonts', doc, faces, root, files }  (a Chromium-based browser only: frame-fonts.ts)
 //   frame → parent  { type: 'ready' }  { type: 'want', urls }  { type: 'resync' }  { type: 'input', doc, events }
 //                   { type: 'address' }  { type: 'fonts', doc }
-import { applyFonts, chromium, type FontsMessage, ownSheet, rewriteFonts } from './frame-fonts.ts';
+import { applyFonts, chromium, fontSheet, type FontsMessage, rewriteFonts } from './frame-fonts.ts';
 import { startInput } from './frame-input.ts';
 
 type Desc = {
@@ -37,7 +37,7 @@ type Desc = {
   sc?: [number, number];
   patch?: 1;
 };
-type Snapshot = { k: 'snap'; url: string; title: string; quirks: boolean; root: Desc | null; adopted: string; scroll: [number, number]; focus?: number };
+type Snapshot = { k: 'snap'; url: string; title: string; quirks: boolean; root: Desc | null; adopted: string; scroll: [number, number]; focus?: number; lw?: number };
 type Op = [string, ...unknown[]];
 
 const NAMESPACES: Record<string, string> = {
@@ -155,9 +155,12 @@ const sheet = (css: string): CSSStyleSheet => {
   return made;
 };
 
+/** Our own rules, after the page's: the page's width (`fitWidth`), and the browser's default font (frame-fonts.ts). */
+const ownSheet = new CSSStyleSheet();
+
 const setAdopted = (css: string): void => {
   pageAdopted = css;
-  document.adoptedStyleSheets = [...(css ? [sheet(css)] : []), ownSheet];
+  document.adoptedStyleSheets = [...(css ? [sheet(css)] : []), ownSheet, fontSheet];
 };
 
 /** The browser's fonts arrived (frame-fonts.ts): every style the page has, rendered again with them. */
@@ -184,6 +187,27 @@ const askFonts = (): void => {
   fontAsks.at = now;
   post({ type: 'fonts', doc: shownDoc });
 };
+
+/**
+ * The width the page lays its content out in, as it said (its window less its scroll bar). The frame's window is the
+ * page's, but its scroll bar may take less room (none where scroll bars float, as on a Mac, or are hidden): then the
+ * page's content is narrowed to the page's width, so its lines break where the page's do. Media queries still see the
+ * page's window.
+ */
+let pageWidth = 0;
+let fittedTo = '';
+const fitWidth = (): void => {
+  const own = document.documentElement.clientWidth;
+  const rule = pageWidth > 0 && own - pageWidth >= 1 ? `html { width: ${pageWidth}px !important; }` : '';
+  if (rule === fittedTo) return;
+  fittedTo = rule;
+  try {
+    ownSheet.replaceSync(rule);
+  } catch {
+    // as before
+  }
+};
+window.addEventListener('resize', fitWidth);
 
 const resourceAttribute = (element: Element, name: string): boolean => {
   const tag = element.localName;
@@ -553,7 +577,9 @@ const showSnapshot = (message: Snapshot, doc: number): void => {
   const root = build(message.root, null);
   if (!(root instanceof Element)) return;
   document.replaceChild(root, document.documentElement);
+  pageWidth = message.lw ?? 0;
   setAdopted(message.adopted);
+  fitWidth();
   input.pageScrolled(0, message.scroll[0], message.scroll[1]);
   for (const [id, [left, top]] of scrolledAtStart) input.pageScrolled(id, left, top);
   scrolledAtStart = [];
@@ -636,6 +662,10 @@ const apply = (op: Op): boolean => {
       return true;
     case 'f':
       input.pageFocused(op[1] as number);
+      return true;
+    case 'w':
+      pageWidth = op[1] as number;
+      fitWidth();
       return true;
     default:
       return true;

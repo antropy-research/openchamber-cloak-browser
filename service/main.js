@@ -2583,6 +2583,11 @@ function mirrorRecorder() {
       adopted = nextAdopted;
       ops.push(["A", adopted]);
     }
+    const width = document.documentElement.clientWidth;
+    if (width !== layoutWidth) {
+      layoutWidth = width;
+      ops.push(["w", width]);
+    }
     if (ops.length)
       queue.push({ k: "ops", ops });
   };
@@ -2657,6 +2662,7 @@ function mirrorRecorder() {
     entry.state = state;
     queue.push({ k: "ops", ops: [["v", id, JSON.parse(state)]] });
   };
+  let layoutWidth = 0;
   const scrolls = new Map;
   let scrollTimer = null;
   const onScroll = (event) => {
@@ -2685,6 +2691,7 @@ function mirrorRecorder() {
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
     lastFocus = focusedId();
+    layoutWidth = document.documentElement.clientWidth;
     return {
       k: "snap",
       url: location.href,
@@ -2693,7 +2700,8 @@ function mirrorRecorder() {
       root,
       adopted,
       scroll: [Math.round(window.scrollX), Math.round(window.scrollY)],
-      focus: lastFocus
+      focus: lastFocus,
+      lw: layoutWidth
     };
   };
   observer = new MutationObserver(flush);

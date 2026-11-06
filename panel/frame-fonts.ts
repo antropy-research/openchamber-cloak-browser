@@ -27,8 +27,8 @@ const hash = (text: string): string => {
 const aliases = new Map<string, string>();
 const added = new Set<string>();
 const buffers = new Map<number, ArrayBuffer>();
-/** Our own rules, after the page's: the browser's default font for text the page sets none for. */
-export const ownSheet = new CSSStyleSheet();
+/** Our own rule, after the page's: the browser's default font for text the page sets none for. */
+export const fontSheet = new CSSStyleSheet();
 
 /** CSS with the browser's face first wherever it names a font-family the face is for. */
 export const rewriteFonts = (css: string): string => {
@@ -75,9 +75,9 @@ export const applyFonts = (message: FontsMessage): boolean => {
   }
   const root = message.root ? aliases.get(normalize(message.root)) : undefined;
   const rule = root ? `:where(html) { font-family: "${root}", ${message.root}; }` : '';
-  if (ownSheet.cssRules.length !== (rule ? 1 : 0) || (rule && ownSheet.cssRules[0]?.cssText !== ownSheetText(rule))) {
+  if (fontSheet.cssRules.length !== (rule ? 1 : 0) || (rule && fontSheet.cssRules[0]?.cssText !== sheetText(rule))) {
     try {
-      ownSheet.replaceSync(rule);
+      fontSheet.replaceSync(rule);
     } catch {
       // as before
     }
@@ -86,7 +86,7 @@ export const applyFonts = (message: FontsMessage): boolean => {
   return changed;
 };
 
-const ownSheetText = (rule: string): string => {
+const sheetText = (rule: string): string => {
   const probe = new CSSStyleSheet();
   try {
     probe.replaceSync(rule);
