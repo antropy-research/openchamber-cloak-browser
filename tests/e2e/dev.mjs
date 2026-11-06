@@ -52,6 +52,8 @@ const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2 });
 const anchorFolder = '/home/node/projects/planner-demo-a';
 let anchorId = null;
+/** The picture's size before the journey (another window's, often Qihang's): one picture is shared, so it is put back. */
+let sizeBefore = null;
 const pageErrors = [];
 let pageWidth = 0;
 try {
@@ -92,6 +94,7 @@ try {
     }
     throw new Error(`${what}: last ${JSON.stringify(last)?.slice(0, 220)}`);
   };
+  sizeBefore = await serviceState().then((state) => (state.surface?.sized ? state.surface : null)).catch(() => null);
   /** One of the agent's browser actions, as the openchamber_web tool sends it. */
   const control = async (action, input = {}) => {
     const res = await context.request.post(`${base}/api/openchamber/control`, { data: { action, input, contextDirectory: SCRATCH }, timeout: 60_000 });
@@ -448,6 +451,9 @@ try {
 } catch (error) {
   results.push({ check: 'run', ok: false, s: '', detail: String(error?.message ?? error).slice(0, 200) });
 } finally {
+  if (sizeBefore) {
+    await context.request.post(`${base}/api/guests/${ID}/service/request`, { data: { method: 'POST', path: '/surface/resize', body: JSON.stringify({ width: sizeBefore.width, height: sizeBefore.height }) } }).catch(() => {});
+  }
   if (anchorId) await context.request.delete(`${base}/api/session/${encodeURIComponent(anchorId)}?directory=${encodeURIComponent(anchorFolder)}`).catch(() => {});
   try {
     execFileSync('docker', ['exec', CONTAINER, 'rm', '-rf', SCRATCH]);
