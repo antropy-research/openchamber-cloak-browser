@@ -5,7 +5,7 @@
 // list does). The journey compares where the page and the panel have the headings, and the marker's gap in the panel.
 // In a Chromium-based window the panel draws with the browser's fonts (frame-fonts.ts): they should agree. With
 // --as-firefox the window says it is Firefox: the panel keeps its own fonts (the page as HTML of phase 1), and they
-// do not. Always on a temporary copy. Usage (holding the dev e2e lock): node tests/e2e/mirror-layout.mjs [--as-firefox]
+// do not. Always on a temporary copy. Usage (holding the dev e2e lock): node tests/e2e/mirror-fonts.mjs [--as-firefox]
 import { checker, log, openPanel, serveInContainer, sleep } from './mirror-lib.mjs';
 
 const firefox = process.argv.includes('--as-firefox');
@@ -37,7 +37,7 @@ document.getElementById('marker').style.top = Math.round(block.bottom + scrollY)
 
 const { check, results } = checker();
 const site = serveInContainer('layout', PAGE);
-const t = await openPanel({ temp: true, out: '/tmp/opencode/cloak-browser-e2e/mirror-layout', ...(firefox ? { userAgent: 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0' } : {}) });
+const t = await openPanel({ temp: true, out: '/tmp/opencode/cloak-browser-e2e/mirror-fonts', ...(firefox ? { userAgent: 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0' } : {}) });
 try {
   await t.waitMirror((frame) => frame.evaluate(() => document.querySelectorAll('body *').length > 5), 90_000);
   await t.go(site.url);
@@ -63,7 +63,7 @@ try {
     check('every heading where the page has it (within 1 px)', deltas.length === 6 && Math.max(...deltas) <= 1, `largest difference ${Math.max(...deltas)} px`);
     check('the marker the page placed by its own measure sits on the block\'s edge', Math.abs(gap) <= 1, `${gap} px`);
   }
-  await t.shoot(`/tmp/opencode/cloak-browser-e2e/mirror-layout/${firefox ? 'firefox' : 'chromium'}.png`);
+  await t.shoot(`/tmp/opencode/cloak-browser-e2e/mirror-fonts/${firefox ? 'firefox' : 'chromium'}.png`);
 } finally {
   await t.close();
   site.stop();
