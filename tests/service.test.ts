@@ -300,12 +300,14 @@ describe('one browser, driven the way OpenChamber drives it', () => {
     await waitFor('a 1200×800 frame of the page', () => frame(service, 0, 0), (f) => f.width === 1200 && f.height === 800 && f.title === 'ratio:2');
   }, 30_000);
 
-  test('a window with another pixel ratio restarts the browser on the address it showed', async () => {
+  // Zooming OpenChamber changes the window's pixel ratio: a restart would load every page again.
+  test('a window with another pixel ratio lays the page out for it, without restarting the browser', async () => {
     const before = chromePid(dataDir);
     await api(service, 'POST', '/viewer', { dpr: 1, mac: false });
-    await waitFor('a new browser on /ratio, drawing at 1×', () => state(service), (s) => s.phase === 'running' && s.url === `${site}/ratio` && s.title === 'ratio:1', 60_000);
-    expect(chromePid(dataDir)).not.toBe(before);
-  }, 90_000);
+    await api(service, 'POST', '/reload');
+    await waitFor('/ratio at 1×', () => state(service), (s) => s.phase === 'running' && s.url === `${site}/ratio` && !s.loading && s.title === 'ratio:1', 30_000);
+    expect(chromePid(dataDir)).toBe(before);
+  }, 60_000);
 });
 
 describe('the browser process', () => {
@@ -322,6 +324,37 @@ describe('the browser process', () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   }, 90_000);
+
+  // OpenChamber stops a browser provider ten minutes after the agent's last action, whoever is browsing in the panel.
+  test('SIGTERM while a panel watches leaves the browser to the next service, which takes it over, tabs and all', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'cloak-test-'));
+    const services: Service[] = [];
+    try {
+      const first = await startService(dataDir);
+      services.push(first);
+      await waitFor('the browser to run', () => state(first), (s) => s.phase === 'running', 60_000);
+      await api(first, 'POST', '/navigate', { url: `${site}/a` });
+      expect(await (await api(first, 'POST', '/tabs', { action: 'new' })).json()).toEqual({ ok: true });
+      await api(first, 'POST', '/navigate', { url: `${site}/b` });
+      type Tabbed = Awaited<ReturnType<typeof state>> & { tabs: Array<{ id: string }> };
+      const tabbed = (service: Service) => state(service) as Promise<Tabbed>;
+      const before = await waitFor('two tabs, /b shown', () => tabbed(first), (s) => s.tabs.length === 2 && s.url === `${site}/b` && !s.loading);
+      // A panel watching: it asked for the page as HTML.
+      await api(first, 'GET', '/mirror/events?after=0&wait=0');
+      const pid = chromePid(dataDir);
+      await stopService(first, 'SIGTERM');
+      await sleep(500);
+      expect(alive(pid)).toBe(true);
+      const second = await startService(dataDir);
+      services.push(second);
+      const after = await waitFor('the same tabs', () => tabbed(second), (s) => s.phase === 'running' && s.tabs.length === 2 && s.url === `${site}/b`, 30_000);
+      expect(chromePid(dataDir)).toBe(pid);
+      expect(after.tabs.map((tab) => tab.id)).toEqual(before.tabs.map((tab) => tab.id));
+    } finally {
+      for (const service of services) await stopService(service).catch(() => {});
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   test('a browser left by a killed service is stopped when the next one starts; the profile keeps its fingerprint', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'cloak-test-'));

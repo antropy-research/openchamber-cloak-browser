@@ -953,7 +953,7 @@ class Agent {
 
 // service/browser.ts
 import { spawn as spawn2 } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync } from "node:fs";
 import { mkdir as mkdir2, readFile as readFile2, readlink, rm as rm2, writeFile as writeFile2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join as join2 } from "node:path";
@@ -1199,6 +1199,24 @@ var VIEWPORTS = {
   tablet: { width: 768, height: 1024, mobile: true },
   desktop: { width: 1440, height: 900, mobile: false }
 };
+var HANDOVER_FILE = "handover.json";
+var HANDOVER_MS = 60000;
+var WATCHDOG = `
+const fs = require('fs');
+const [file, pidText, deadlineText] = process.argv.slice(1);
+const pid = Number(pidText), deadline = Number(deadlineText);
+const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const tick = () => {
+  let handover = null;
+  try { handover = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+  if (!handover || handover.pid !== pid) process.exit(0);
+  if (!alive()) { try { fs.rmSync(file, { force: true }); } catch {} process.exit(0); }
+  if (Date.now() < deadline) { setTimeout(tick, 1000); return; }
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+  setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch {} try { fs.rmSync(file, { force: true }); } catch {} process.exit(0); }, 5000);
+};
+tick();
+`;
 var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var alive = (pid) => {
   try {
@@ -1249,6 +1267,9 @@ class Browser {
   canGoBack = false;
   canGoForward = false;
   child = null;
+  adoptedPid = null;
+  wsUrl = "";
+  handedOver = false;
   starting = null;
   scale = 1;
   launchedScale = 0;
@@ -1315,11 +1336,9 @@ class Browser {
       return;
     this.scale = scale;
     await this.saveViewer();
-    if (this.phase !== "running" || this.launchedScale === scale)
-      return;
-    await this.saveLastUrl();
-    await this.stop();
-    await this.start().catch(() => {});
+    for (const tab of this.tabs.values())
+      if (tab.sessionId)
+        this.applyViewport(tab).catch(() => {});
   }
   async rememberSize(width, height) {
     if (this.savedSize?.width === width && this.savedSize.height === height)
@@ -1358,10 +1377,81 @@ class Browser {
       if (child.exitCode === null && child.signalCode === null)
         child.kill("SIGKILL");
     }
+    const adopted = this.adoptedPid;
+    this.adoptedPid = null;
+    if (adopted && alive(adopted)) {
+      try {
+        process.kill(adopted, "SIGTERM");
+      } catch {}
+      for (let wait = 0;wait < 30 && alive(adopted); wait += 1)
+        await sleep2(100);
+      if (alive(adopted))
+        process.kill(adopted, "SIGKILL");
+    }
     this.cdp = null;
     this.tabs.clear();
     this.shownId = null;
     this.changed();
+  }
+  async handOver() {
+    const pid = this.child?.pid ?? this.adoptedPid;
+    if (this.phase !== "running" || !this.cdp || this.cdp.closed || !pid || !this.wsUrl)
+      return false;
+    const handover = {
+      pid,
+      ws: this.wsUrl,
+      profile: this.profile,
+      scale: this.launchedScale || this.scale,
+      shownId: this.shownId,
+      order: [...this.tabs.keys()],
+      tabs: Object.fromEntries([...this.tabs.values()].map((tab) => [tab.id, { openedBy: tab.openedBy, viewport: tab.viewport }])),
+      at: Date.now()
+    };
+    const file = join2(this.options.dataDir, HANDOVER_FILE);
+    try {
+      await writeFile2(file, `${JSON.stringify(handover)}
+`);
+    } catch {
+      return false;
+    }
+    const env = { ...process.env };
+    for (const key of Object.keys(env))
+      if (key.startsWith("OPENCHAMBER_"))
+        delete env[key];
+    const watchdog = spawn2(process.execPath, ["-e", WATCHDOG, file, String(pid), String(handover.at + HANDOVER_MS)], { detached: true, stdio: "ignore", env });
+    watchdog.unref();
+    this.handedOver = true;
+    this.cdp.close();
+    this.cdp = null;
+    this.child = null;
+    this.adoptedPid = null;
+    return true;
+  }
+  async adopt() {
+    const file = join2(this.options.dataDir, HANDOVER_FILE);
+    let handover;
+    try {
+      handover = JSON.parse(await readFile2(file, "utf8"));
+    } catch {
+      return null;
+    }
+    await rm2(file, { force: true }).catch(() => {});
+    if (handover.profile !== this.profile || !Number.isInteger(handover.pid) || !alive(handover.pid) || Date.now() - handover.at > HANDOVER_MS)
+      return null;
+    try {
+      const command = (await readFile2(`/proc/${handover.pid}/cmdline`)).toString("utf8").replaceAll("\x00", " ");
+      if (!command.includes(`--user-data-dir=${this.profile}`))
+        return null;
+      const port = new URL(handover.ws).port;
+      const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) })).json();
+      if (version.webSocketDebuggerUrl !== handover.ws)
+        return null;
+    } catch {
+      return null;
+    }
+    this.adoptedPid = handover.pid;
+    this.launchedScale = handover.scale;
+    return handover;
   }
   async ready() {
     await this.start();
@@ -1586,17 +1676,20 @@ class Browser {
       this.phase = "starting";
       this.changed();
       const seed = await profileSeed(join2(this.options.dataDir, "fingerprint-seed"));
-      await stopLeftover(this.profile);
-      const url = await this.spawnBrowser(this.binary.path, seed);
+      const handover = await this.adopt();
+      if (!handover)
+        await stopLeftover(this.profile);
+      const url = handover?.ws ?? await this.spawnBrowser(this.binary.path, seed);
       const cdp = await Cdp.connect(url);
       this.cdp = cdp;
+      this.wsUrl = url;
       cdp.on((event) => {
         this.onEvent(event);
         for (const listener of [...this.eventListeners])
           listener(event);
       });
       cdp.onClose(() => {
-        if (this.cdp !== cdp)
+        if (this.cdp !== cdp || this.handedOver)
           return;
         this.cdp = null;
         this.tabs.clear();
@@ -1614,6 +1707,33 @@ class Browser {
         await sleep2(20);
       await sleep2(300);
       this.phase = "running";
+      if (handover) {
+        const tabs = [...this.tabs.values()];
+        this.tabs.clear();
+        for (const id of handover.order) {
+          const tab = tabs.find((each) => each.id === id);
+          if (tab)
+            this.tabs.set(id, tab);
+        }
+        for (const tab of tabs)
+          if (!this.tabs.has(tab.id))
+            this.tabs.set(tab.id, tab);
+        for (const tab of this.tabs.values()) {
+          const known = handover.tabs[tab.id];
+          if (!known)
+            continue;
+          tab.openedBy = known.openedBy;
+          if (known.viewport !== tab.viewport) {
+            tab.viewport = known.viewport;
+            tab.ready?.then(() => this.applyViewport(tab)).catch(() => {});
+          }
+        }
+        const shown = handover.shownId && this.tabs.get(handover.shownId)?.sessionId ? handover.shownId : [...this.tabs.values()].find((tab) => tab.sessionId)?.id;
+        if (shown) {
+          await this.showNow(shown);
+          return;
+        }
+      }
       const last = await this.lastUrl();
       const open = [...this.tabs.values()].filter((tab) => tab.sessionId);
       const first = open.find((tab) => tab.url === last) ?? open.find((tab) => tab.url === "about:blank") ?? open[0] ?? await this.newTabNow({ background: true });
@@ -1630,7 +1750,11 @@ class Browser {
       throw error;
     }
   }
-  spawnBrowser(binary, seed) {
+  async spawnBrowser(binary, seed) {
+    const portFile = join2(this.profile, "DevToolsActivePort");
+    const logFile = join2(this.options.dataDir, "browser.log");
+    await rm2(portFile, { force: true }).catch(() => {});
+    const log = openSync(logFile, "w");
     const env = { ...process.env };
     delete env.DBUS_SESSION_BUS_ADDRESS;
     for (const key of Object.keys(env))
@@ -1651,9 +1775,11 @@ class Browser {
       `--fingerprint=${seed}`,
       "--fingerprint-platform=windows",
       "about:blank"
-    ], { stdio: ["ignore", "ignore", "pipe"], env });
+    ], { stdio: ["ignore", "ignore", log], env });
+    closeSync(log);
     this.child = child;
     this.launchedScale = this.scale;
+    this.handedOver = false;
     child.on("exit", (code, signal) => {
       if (this.child !== child)
         return;
@@ -1664,28 +1790,26 @@ class Browser {
         this.changed();
       }
     });
-    return new Promise((resolve, reject) => {
-      let stderr = "";
-      const timer = setTimeout(() => reject(new Error(`The browser did not start within 30 s. ${stderr.trim().split(`
-`).slice(-3).join(" ")}`)), 30000);
-      child.stderr?.on("data", (chunk) => {
-        stderr = (stderr + chunk.toString("utf8")).slice(-4000);
-        const match = /DevTools listening on (ws:\/\/\S+)/.exec(stderr);
-        if (match) {
-          clearTimeout(timer);
-          resolve(match[1]);
-        }
-      });
-      child.on("error", (error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
-      child.on("exit", (code, signal) => {
-        clearTimeout(timer);
-        reject(new Error(`The browser exited while starting (${signal ?? `code ${code}`}). ${stderr.trim().split(`
-`).slice(-3).join(" ")}`));
-      });
+    const tail = async () => (await readFile2(logFile, "utf8").catch(() => "")).trim().split(`
+`).slice(-3).join(" ");
+    let failure = null;
+    child.on("error", (error) => {
+      failure = error;
     });
+    child.on("exit", (code, signal) => {
+      failure ??= new Error(`The browser exited while starting (${signal ?? `code ${code}`}).`);
+    });
+    const end = Date.now() + 30000;
+    while (Date.now() < end) {
+      if (failure)
+        throw new Error(`${failure.message} ${await tail()}`.trim());
+      const lines = (await readFile2(portFile, "utf8").catch(() => "")).split(`
+`);
+      if (lines.length >= 2 && /^\d+$/.test(lines[0]) && lines[1].startsWith("/devtools/browser/"))
+        return `ws://127.0.0.1:${lines[0]}${lines[1].trim()}`;
+      await sleep2(50);
+    }
+    throw new Error(`The browser did not start within 30 s. ${await tail()}`.trim());
   }
   nextLoad(session, timeoutMs) {
     return new Promise((resolve) => {
@@ -1929,6 +2053,85 @@ class Browser {
       return;
     await writeFile2(join2(this.options.dataDir, "last.json"), `${JSON.stringify({ url })}
 `).catch(() => {});
+  }
+}
+
+// service/control.ts
+var AGENT_HOLD_MS = 30000;
+var USER_IDLE_MS = 60000;
+var VIEWER_GONE_MS = 20000;
+var USER_HAS_CONTROL = "The user is interacting with this page in the panel right now, so the action was not run. " + "Wait for them to hand control back, or ask them to. Nothing was changed.";
+
+class Control {
+  changed;
+  controller = "none";
+  viewer = null;
+  agentUntil = 0;
+  userAt = 0;
+  seen = new Map;
+  constructor(changed = () => {}) {
+    this.changed = changed;
+  }
+  see(viewer) {
+    if (viewer)
+      this.seen.set(viewer, Date.now());
+  }
+  state(viewer) {
+    this.settle();
+    return { controller: this.controller, mine: this.controller === "user" && this.viewer === viewer };
+  }
+  userActs(viewer) {
+    this.settle();
+    if (!viewer || this.controller === "user" && this.viewer !== viewer)
+      return false;
+    const was = this.controller;
+    this.controller = "user";
+    this.viewer = viewer;
+    this.userAt = Date.now();
+    this.see(viewer);
+    if (was !== "user")
+      this.changed();
+    return true;
+  }
+  userLooks(viewer) {
+    this.settle();
+    return this.controller === "user" && this.viewer === viewer;
+  }
+  release(viewer) {
+    this.settle();
+    if (this.controller !== "user" || this.viewer !== viewer)
+      return;
+    this.controller = "none";
+    this.viewer = null;
+    this.changed();
+  }
+  agentActs() {
+    this.settle();
+    if (this.controller === "user")
+      return false;
+    const was = this.controller;
+    this.controller = "agent";
+    this.agentUntil = Date.now() + AGENT_HOLD_MS;
+    if (was !== "agent")
+      this.changed();
+    return true;
+  }
+  settle() {
+    const now = Date.now();
+    if (this.controller === "user") {
+      const seen = this.seen.get(this.viewer ?? "") ?? 0;
+      if (now - this.userAt > USER_IDLE_MS || now - seen > VIEWER_GONE_MS) {
+        this.controller = "none";
+        this.viewer = null;
+        this.changed();
+      }
+    } else if (this.controller === "agent" && now > this.agentUntil) {
+      this.controller = "none";
+      this.changed();
+    }
+    for (const [viewer, at] of this.seen)
+      if (now - at > VIEWER_GONE_MS * 3)
+        this.seen.delete(viewer);
   }
 }
 
@@ -2517,7 +2720,7 @@ function mirrorRecorder() {
 var RECORDER = `(${mirrorRecorder.toString()})();`;
 var WORLD = "cloak-mirror";
 var DRAIN_MS = 50;
-var VIEWER_GONE_MS = 20000;
+var VIEWER_GONE_MS2 = 20000;
 var WAIT_MAX_MS = 15000;
 var LOG_BYTES_MAX = 6000000;
 var RESOURCES_BYTES_MAX = 5000000;
@@ -2566,7 +2769,7 @@ class Mirror {
     });
   }
   get watched() {
-    return Date.now() - this.lastViewerAt < VIEWER_GONE_MS;
+    return Date.now() - this.lastViewerAt < VIEWER_GONE_MS2;
   }
   async events(afterSeq, waitMs, run, patchAfterSeq = 0, picture = false) {
     const known = run === this.run;
@@ -2662,7 +2865,18 @@ class Mirror {
     }
     return { resources, later };
   }
+  async release() {
+    await this.stopRecorder(this.tab, this.contextId);
+    this.contextId = null;
+  }
+  async stopRecorder(tab, contextId) {
+    if (!tab?.sessionId || contextId === null || !this.browser.cdp)
+      return;
+    await this.browser.cdp.send("Runtime.evaluate", { expression: "globalThis.__cloakMirror && globalThis.__cloakMirror.stop()", contextId }, tab.sessionId, 3000).catch(() => {});
+  }
   retarget(tab) {
+    if (this.tab && this.tab !== tab)
+      this.stopRecorder(this.tab, this.contextId);
     this.tab = tab;
     this.contextId = null;
     this.doc += 1;
@@ -2759,10 +2973,7 @@ class Mirror {
       }
       await sleep3(DRAIN_MS);
     }
-    const tab = this.tab;
-    if (tab?.sessionId && this.contextId !== null && this.browser.cdp) {
-      await this.browser.cdp.send("Runtime.evaluate", { expression: "globalThis.__cloakMirror && globalThis.__cloakMirror.stop()", contextId: this.contextId }, tab.sessionId, 3000).catch(() => {});
-    }
+    await this.stopRecorder(this.tab, this.contextId);
     this.contextId = null;
   }
   async capturePatches(tab, doc) {
@@ -2773,7 +2984,7 @@ class Mirror {
     const coverage = area > 0 ? Math.min(1, list.reduce((sum, entry) => sum + entry[3] * entry[4], 0) / area) : 0;
     let changed = Math.abs(coverage - this.coverage) > 0.05;
     this.coverage = Math.round(coverage * 100) / 100;
-    if (!cdp || !tab.sessionId || !list.length || Date.now() - this.patchesWantedAt > VIEWER_GONE_MS)
+    if (!cdp || !tab.sessionId || !list.length || Date.now() - this.patchesWantedAt > VIEWER_GONE_MS2)
       return changed;
     for (const entry of list) {
       const [id, x, y, w, h, dx, dy, tag] = entry;
@@ -2973,7 +3184,7 @@ var readEvent2 = (value) => {
 };
 var readMirrorInput = (body) => {
   const b = body;
-  if (!b || typeof b !== "object" || !int(b.doc) || !Array.isArray(b.events) || b.events.length > EVENTS_MAX)
+  if (!b || typeof b !== "object" || !int(b.doc) || !str(b.viewer, 100) || !b.viewer || !Array.isArray(b.events) || b.events.length > EVENTS_MAX)
     return null;
   const events = [];
   for (const value of b.events) {
@@ -2982,9 +3193,13 @@ var readMirrorInput = (body) => {
       return null;
     events.push(event);
   }
-  return { doc: b.doc, events };
+  return { doc: b.doc, viewer: b.viewer, events };
 };
-var applyMirrorInput = async (input, mirror, surface) => {
+var applyMirrorInput = async (input, mirror, surface, control) => {
+  const isMove = (event) => event.type === "pointer" && event.action === "move";
+  if (input.events.some((event) => !isMove(event)) && !control.userActs(input.viewer))
+    throw new Error("Another device has control");
+  const looks = control.userLooks(input.viewer);
   let batch = [];
   const flush = async () => {
     if (!batch.length)
@@ -2994,6 +3209,8 @@ var applyMirrorInput = async (input, mirror, surface) => {
     await surface.input(events, { css: true });
   };
   for (const event of input.events) {
+    if (isMove(event) && !looks)
+      continue;
     switch (event.type) {
       case "pointer":
       case "wheel": {
@@ -3668,6 +3885,7 @@ var browser = new Browser({
 var surface = new Surface(browser);
 var agent = new Agent(browser, surface);
 var mirror = new Mirror(browser);
+var control = new Control(() => mirror.wake());
 var readBody = (req) => new Promise((resolve, reject) => {
   let body = "";
   req.setEncoding("utf8");
@@ -3707,10 +3925,25 @@ var route = async (req, res) => {
   switch (`${req.method} ${url.pathname}`) {
     case "GET /health":
       return send(res, 200, { ok: true });
-    case "GET /state":
+    case "GET /state": {
       browser.start().catch(() => {});
       await browser.refresh();
-      return send(res, 200, { ...browser.state(), ...surface.stripState(), youControl: req.headers[SURFACE_VIEWER_CONTROLS_HEADER] === "1" });
+      const viewer = url.searchParams.get("viewer") ?? "";
+      control.see(viewer);
+      return send(res, 200, {
+        ...browser.state(),
+        ...surface.stripState(),
+        youControl: req.headers[SURFACE_VIEWER_CONTROLS_HEADER] === "1",
+        control: control.state(viewer),
+        agentActive: surface.agentActive
+      });
+    }
+    case "POST /control": {
+      const body = await readJson(req);
+      if (body?.action === "release" && typeof body.viewer === "string")
+        control.release(body.viewer);
+      return send(res, 200, { ok: true });
+    }
     case "POST /navigate": {
       const body = await readJson(req);
       const address = typeof body?.url === "string" ? body.url.trim() : "";
@@ -3771,7 +4004,7 @@ var route = async (req, res) => {
       const input = readMirrorInput(await readJson(req));
       if (!input)
         return send(res, 400, { ok: false, error: "Not mirror input" });
-      return command(res, () => applyMirrorInput(input, mirror, surface));
+      return command(res, () => applyMirrorInput(input, mirror, surface, control));
     }
     case "POST /mirror/wake":
       mirror.wake();
@@ -3804,6 +4037,8 @@ var route = async (req, res) => {
       const request = readBrowserProviderRequest(await readBody(req));
       if (!request)
         return send(res, 400, { ok: false, error: "Not a browser action" });
+      if (!control.agentActs())
+        return send(res, 200, { ok: false, error: USER_HAS_CONTROL });
       return send(res, 200, await agent.handle(request));
     }
     case "POST /reload":
@@ -3882,7 +4117,15 @@ var shutdown = () => {
     return;
   stopping = true;
   server.close();
-  browser.stop().finally(() => process.exit(0));
+  const end = async () => {
+    if (mirror.watched) {
+      await mirror.release();
+      if (await browser.handOver())
+        return;
+    }
+    await browser.stop();
+  };
+  end().catch(() => {}).finally(() => process.exit(0));
 };
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);

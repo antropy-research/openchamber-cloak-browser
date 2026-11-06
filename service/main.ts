@@ -28,6 +28,7 @@ import {
 import { toUrl } from './address.ts';
 import { Agent } from './agent.ts';
 import { Browser } from './browser.ts';
+import { Control, USER_HAS_CONTROL } from './control.ts';
 import { Mirror } from './mirror.ts';
 import { applyMirrorInput, readMirrorInput } from './mirror-input.ts';
 import { Surface } from './surface.ts';
@@ -49,6 +50,7 @@ const browser = new Browser({
 const surface = new Surface(browser);
 const agent = new Agent(browser, surface);
 const mirror = new Mirror(browser);
+const control = new Control(() => mirror.wake());
 
 const readBody = (req: http.IncomingMessage): Promise<string> => new Promise((resolve, reject) => {
   let body = '';
@@ -92,11 +94,26 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
   switch (`${req.method} ${url.pathname}`) {
     case 'GET /health':
       return send(res, 200, { ok: true });
-    case 'GET /state':
+    case 'GET /state': {
       void browser.start().catch(() => {});
       await browser.refresh();
-      // The window the strip is in holds the picture (OpenChamber names it on a page's requests).
-      return send(res, 200, { ...browser.state(), ...surface.stripState(), youControl: req.headers[SURFACE_VIEWER_CONTROLS_HEADER] === '1' });
+      // `viewer`: the asking window's panel, which is then still open; who holds control is said for it.
+      const viewer = url.searchParams.get('viewer') ?? '';
+      control.see(viewer);
+      return send(res, 200, {
+        ...browser.state(),
+        ...surface.stripState(),
+        youControl: req.headers[SURFACE_VIEWER_CONTROLS_HEADER] === '1',
+        control: control.state(viewer),
+        agentActive: surface.agentActive,
+      });
+    }
+    case 'POST /control': {
+      // The strip's "Hand back to agent".
+      const body = await readJson(req);
+      if (body?.action === 'release' && typeof body.viewer === 'string') control.release(body.viewer);
+      return send(res, 200, { ok: true });
+    }
     case 'POST /navigate': {
       const body = await readJson(req);
       const address = typeof body?.url === 'string' ? body.url.trim() : '';
@@ -159,7 +176,7 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
       // The user's pointer, wheel, keys and text on the page in the panel, made real input in the page.
       const input = readMirrorInput(await readJson(req));
       if (!input) return send(res, 400, { ok: false, error: 'Not mirror input' });
-      return command(res, () => applyMirrorInput(input, mirror, surface));
+      return command(res, () => applyMirrorInput(input, mirror, surface, control));
     }
     case 'POST /mirror/wake':
       // A view lost its place: the requests waiting for news are answered now, and it asks for the page again.
@@ -195,6 +212,8 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
     case `POST ${BROWSER_PROVIDER_PATH}`: {
       const request = readBrowserProviderRequest(await readBody(req));
       if (!request) return send(res, 400, { ok: false, error: 'Not a browser action' });
+      // The user is working in the page in the panel: the agent waits or asks (control.ts).
+      if (!control.agentActs()) return send(res, 200, { ok: false, error: USER_HAS_CONTROL });
       return send(res, 200, await agent.handle(request));
     }
     case 'POST /reload':
@@ -263,14 +282,23 @@ const server = http.createServer((req, res) => {
 });
 server.listen(port, '127.0.0.1');
 
-// OpenChamber stops a service with SIGTERM (then SIGKILL): the browser goes with it. One killed outright leaves its
-// browser behind, which the next start stops (browser.ts, stopLeftover).
+// OpenChamber stops a service with SIGTERM (then SIGKILL, 5 s later). With a panel watching, the browser stays for the
+// next service, which the panel's next request starts (browser.ts, handOver): OpenChamber stops a browser provider
+// ten minutes after the agent's last action, whoever is browsing. Without one, the browser goes with the service. A
+// service killed outright leaves its browser behind, which the next start stops (browser.ts, stopLeftover).
 let stopping = false;
 const shutdown = (): void => {
   if (stopping) return;
   stopping = true;
   server.close();
-  void browser.stop().finally(() => process.exit(0));
+  const end = async (): Promise<void> => {
+    if (mirror.watched) {
+      await mirror.release();
+      if (await browser.handOver()) return;
+    }
+    await browser.stop();
+  };
+  void end().catch(() => {}).finally(() => process.exit(0));
 };
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);

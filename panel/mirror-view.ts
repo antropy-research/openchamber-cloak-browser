@@ -39,6 +39,8 @@ export type ViewMode = { picture: boolean; chosen: boolean };
 
 export type MirrorViewOptions = {
   host: HostClient;
+  /** This window's panel: the service says who holds control by it (service/control.ts). */
+  viewer: string;
   /** The page has been shown (its first snapshot), or the view has none to show. */
   onShown?: (shown: boolean) => void;
   /** The view became a picture or HTML again; `chosen`: the user asked for it. */
@@ -51,6 +53,7 @@ export class MirrorView {
   private readonly host: HostClient;
   private readonly onShown: (shown: boolean) => void;
   private readonly onMode: (mode: ViewMode) => void;
+  private readonly viewer: string;
   private readonly picture: PictureView;
   /** The user's choice for this page (null: none), and what the page itself calls for. */
   private chosen: boolean | null = null;
@@ -73,11 +76,18 @@ export class MirrorView {
   /** The user's input, in order: one request at a time, the rest waiting (a pointer move replaced by the next). */
   private inputQueue: InputBatch[] = [];
   private sendingInput = false;
+  /**
+   * Whether this window holds control (service/control.ts): pointer moves go only then. Acting here takes it at once,
+   * so a drag right after the first click is whole; the service's word (setControl) counts again a moment later.
+   */
+  private mine = false;
+  private actedAt = 0;
 
   constructor(parent: HTMLElement, options: MirrorViewOptions) {
     this.host = options.host;
     this.onShown = options.onShown ?? (() => {});
     this.onMode = options.onMode ?? (() => {});
+    this.viewer = options.viewer;
     this.element = document.createElement('div');
     this.element.className = 'view';
     this.frame = document.createElement('iframe');
@@ -250,9 +260,21 @@ export class MirrorView {
     }
   }
 
+  /** What the service says of this window's control. */
+  setControl(mine: boolean): void {
+    if (!mine && Date.now() - this.actedAt < 1500) return;
+    this.mine = mine;
+  }
+
   private queueInput(batch: InputBatch): void {
     const last = this.inputQueue.at(-1);
     const isMove = (events: unknown[]) => events.length === 1 && (events[0] as { type?: string; action?: string }).type === 'pointer' && (events[0] as { action?: string }).action === 'move';
+    if (!isMove(batch.events)) {
+      this.mine = true;
+      this.actedAt = Date.now();
+    } else if (!this.mine) {
+      return;
+    }
     if (last && last.doc === batch.doc && isMove(last.events) && isMove(batch.events)) this.inputQueue[this.inputQueue.length - 1] = batch;
     else if (last && last.doc === batch.doc && !isMove(last.events) && !isMove(batch.events) && last.events.length + batch.events.length <= 200) last.events.push(...batch.events);
     else this.inputQueue.push(batch);
@@ -265,7 +287,7 @@ export class MirrorView {
     try {
       while (this.inputQueue.length) {
         const batch = this.inputQueue.shift() as InputBatch;
-        await this.host.serviceRequest({ method: 'POST', path: '/mirror/input', body: JSON.stringify(batch) }).catch(() => {});
+        await this.host.serviceRequest({ method: 'POST', path: '/mirror/input', body: JSON.stringify({ ...batch, viewer: this.viewer }) }).catch(() => {});
       }
     } finally {
       this.sendingInput = false;

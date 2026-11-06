@@ -223,7 +223,20 @@ export class Mirror {
     return { resources, later };
   }
 
+  /** The recorder rests in the page shown: the service is stopping. */
+  async release(): Promise<void> {
+    await this.stopRecorder(this.tab, this.contextId);
+    this.contextId = null;
+  }
+
+  private async stopRecorder(tab: Tab | null, contextId: number | null): Promise<void> {
+    if (!tab?.sessionId || contextId === null || !this.browser.cdp) return;
+    await this.browser.cdp.send('Runtime.evaluate', { expression: 'globalThis.__cloakMirror && globalThis.__cloakMirror.stop()', contextId }, tab.sessionId, 3000).catch(() => {});
+  }
+
   private retarget(tab: Tab): void {
+    // Another tab: the recorder in the one shown before rests (its queue would grow with nobody draining it).
+    if (this.tab && this.tab !== tab) void this.stopRecorder(this.tab, this.contextId);
     this.tab = tab;
     this.contextId = null;
     this.doc += 1;
@@ -327,10 +340,7 @@ export class Mirror {
       await sleep(DRAIN_MS);
     }
     // Nobody watches: the recorder rests until a panel asks again.
-    const tab = this.tab;
-    if (tab?.sessionId && this.contextId !== null && this.browser.cdp) {
-      await this.browser.cdp.send('Runtime.evaluate', { expression: 'globalThis.__cloakMirror && globalThis.__cloakMirror.stop()', contextId: this.contextId }, tab.sessionId, 3000).catch(() => {});
-    }
+    await this.stopRecorder(this.tab, this.contextId);
     this.contextId = null;
   }
 

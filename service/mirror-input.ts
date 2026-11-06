@@ -8,6 +8,7 @@
 // on the screen (`r` -2) and no document (`doc` -1): they go where they are.
 import type { SurfaceInputEvent, SurfaceModifiers } from '@openchamber/sdk';
 
+import type { Control } from './control.ts';
 import type { Mirror } from './mirror.ts';
 import type { Surface } from './surface.ts';
 
@@ -19,7 +20,8 @@ export type MirrorInputEvent =
   | { type: 'text'; text: string }
   | { type: 'select'; id: number; index: number }
   | { type: 'scroll'; id: number; left: number; top: number };
-export type MirrorInput = { doc: number; events: MirrorInputEvent[] };
+/** `viewer`: the window the input was made in (control.ts). */
+export type MirrorInput = { doc: number; viewer: string; events: MirrorInputEvent[] };
 
 const EVENTS_MAX = 500;
 const TEXT_MAX = 100_000;
@@ -74,18 +76,24 @@ const readEvent = (value: unknown): MirrorInputEvent | null => {
 /** `POST /mirror/input`'s body, or null when it is not one. */
 export const readMirrorInput = (body: unknown): MirrorInput | null => {
   const b = body as Record<string, unknown> | null;
-  if (!b || typeof b !== 'object' || !int(b.doc) || !Array.isArray(b.events) || b.events.length > EVENTS_MAX) return null;
+  if (!b || typeof b !== 'object' || !int(b.doc) || !str(b.viewer, 100) || !b.viewer || !Array.isArray(b.events) || b.events.length > EVENTS_MAX) return null;
   const events: MirrorInputEvent[] = [];
   for (const value of b.events) {
     const event = readEvent(value);
     if (!event) return null;
     events.push(event);
   }
-  return { doc: b.doc, events };
+  return { doc: b.doc, viewer: b.viewer, events };
 };
 
-/** Applies the panel's input, in order. */
-export const applyMirrorInput = async (input: MirrorInput, mirror: Mirror, surface: Surface): Promise<void> => {
+/**
+ * Applies the panel's input, in order. Acting (anything but a pointer move) takes control for the window, unless
+ * another window holds it; moves go only while the window holds control.
+ */
+export const applyMirrorInput = async (input: MirrorInput, mirror: Mirror, surface: Surface, control: Control): Promise<void> => {
+  const isMove = (event: MirrorInputEvent) => event.type === 'pointer' && event.action === 'move';
+  if (input.events.some((event) => !isMove(event)) && !control.userActs(input.viewer)) throw new Error('Another device has control');
+  const looks = control.userLooks(input.viewer);
   let batch: SurfaceInputEvent[] = [];
   const flush = async (): Promise<void> => {
     if (!batch.length) return;
@@ -94,6 +102,7 @@ export const applyMirrorInput = async (input: MirrorInput, mirror: Mirror, surfa
     await surface.input(events, { css: true });
   };
   for (const event of input.events) {
+    if (isMove(event) && !looks) continue;
     switch (event.type) {
       case 'pointer':
       case 'wheel': {

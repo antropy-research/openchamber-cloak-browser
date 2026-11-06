@@ -2,8 +2,14 @@
 // over CDP. Chrome attaches every tab to this connection (Target.setAutoAttach), so each tab has a session of its own:
 // the picture shows one of them (the shown tab), and the agent's actions can work in any. The browser starts on the
 // first request that needs it and starts again after it exits.
+//
+// OpenChamber stops a browser provider's service ten minutes after the agent's last action, a panel watching or not
+// (only its own shared picture kept a service up). So a service stopped while a panel watches leaves the browser
+// running and says how to reach it (handOver): the next service, which the panel's next request starts, takes it
+// over (adopt), tabs, pages and all. A watchdog stops a browser nobody takes over within HANDOVER_MS (the extension was
+// paused or removed).
 import { type ChildProcess, spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
@@ -62,6 +68,42 @@ export type BrowserState = {
 };
 
 type TargetInfo = { targetId: string; type: string; url: string; title: string; openerId?: string };
+
+/** What a stopped service leaves the next one: its running browser, and what the tabs were to it. */
+type Handover = {
+  pid: number;
+  ws: string;
+  profile: string;
+  scale: number;
+  shownId: string | null;
+  order: string[];
+  tabs: Record<string, { openedBy: string | null; viewport: BrowserViewportMode }>;
+  at: number;
+};
+const HANDOVER_FILE = 'handover.json';
+/** A browser handed over and not taken within this long is stopped. */
+const HANDOVER_MS = 60_000;
+
+/**
+ * The watchdog a handover leaves (`node -e`, detached): it stops the browser once HANDOVER_MS pass with the handover
+ * still there, and goes once a service took it (the file is gone) or the browser exited.
+ */
+const WATCHDOG = `
+const fs = require('fs');
+const [file, pidText, deadlineText] = process.argv.slice(1);
+const pid = Number(pidText), deadline = Number(deadlineText);
+const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const tick = () => {
+  let handover = null;
+  try { handover = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+  if (!handover || handover.pid !== pid) process.exit(0);
+  if (!alive()) { try { fs.rmSync(file, { force: true }); } catch {} process.exit(0); }
+  if (Date.now() < deadline) { setTimeout(tick, 1000); return; }
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+  setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch {} try { fs.rmSync(file, { force: true }); } catch {} process.exit(0); }, 5000);
+};
+tick();
+`;
 
 export type BrowserOptions = {
   /** Profile, fingerprint seed, the last address and pixel ratio: what survives a restart. */
@@ -132,11 +174,17 @@ export class Browser {
   private canGoBack = false;
   private canGoForward = false;
   private child: ChildProcess | null = null;
+  /** A browser an earlier service handed over (adopt): not this process's child, so it is stopped by its pid. */
+  private adoptedPid: number | null = null;
+  /** The DevTools address of the browser this service drives. */
+  private wsUrl = '';
+  /** This service handed its browser over (handOver): its going is not the browser's. */
+  private handedOver = false;
   private starting: Promise<void> | null = null;
   /**
-   * The pixel ratio the picture is drawn at. A headless screencast ignores an emulated device scale factor and
-   * sends CSS-sized frames, so the ratio is a launch flag (--force-device-scale-factor): a new ratio restarts the
-   * browser. Kept beside the profile, so the next start uses the last window's.
+   * The window's pixel ratio. Pages get it as an emulated scale factor (applyViewport). A headless screencast
+   * ignores that and draws at the launch flag (--force-device-scale-factor), so the page as a picture takes a new
+   * ratio at the next start. Kept beside the profile, so the next start uses the last window's.
    */
   private scale = 1;
   private launchedScale = 0;
@@ -210,15 +258,16 @@ export class Browser {
     };
   }
 
-  /** The window's pixel ratio, from the strip. Restarts a browser drawing at another, on the address it shows. */
+  /**
+   * The pixel ratio of the window the panel is in. Pages are laid out for it at once (an emulated scale factor:
+   * devicePixelRatio, the images a page picks, media queries); the browser's own drawing (the page as a picture)
+   * takes it at its next start. A browser is never restarted for it: zooming OpenChamber would reload every page.
+   */
   async setScale(scale: number): Promise<void> {
     if (scale === this.scale) return;
     this.scale = scale;
     await this.saveViewer();
-    if (this.phase !== 'running' || this.launchedScale === scale) return;
-    await this.saveLastUrl();
-    await this.stop();
-    await this.start().catch(() => {});
+    for (const tab of this.tabs.values()) if (tab.sessionId) void this.applyViewport(tab).catch(() => {});
   }
 
   /** The panel's size, kept with the pixel ratio: a service started again begins at it (Surface). */
@@ -259,10 +308,82 @@ export class Browser {
       for (let wait = 0; wait < 30 && child.exitCode === null && child.signalCode === null; wait += 1) await sleep(100);
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
+    const adopted = this.adoptedPid;
+    this.adoptedPid = null;
+    if (adopted && alive(adopted)) {
+      try {
+        process.kill(adopted, 'SIGTERM');
+      } catch {
+        // gone
+      }
+      for (let wait = 0; wait < 30 && alive(adopted); wait += 1) await sleep(100);
+      if (alive(adopted)) process.kill(adopted, 'SIGKILL');
+    }
     this.cdp = null;
     this.tabs.clear();
     this.shownId = null;
     this.changed();
+  }
+
+  /**
+   * The service is stopping while a panel watches: the browser stays, for the next service to take over (adopt), and
+   * a watchdog stops it if none does within HANDOVER_MS. False when there is no browser to hand over.
+   */
+  async handOver(): Promise<boolean> {
+    const pid = this.child?.pid ?? this.adoptedPid;
+    if (this.phase !== 'running' || !this.cdp || this.cdp.closed || !pid || !this.wsUrl) return false;
+    const handover: Handover = {
+      pid,
+      ws: this.wsUrl,
+      profile: this.profile,
+      scale: this.launchedScale || this.scale,
+      shownId: this.shownId,
+      order: [...this.tabs.keys()],
+      tabs: Object.fromEntries([...this.tabs.values()].map((tab) => [tab.id, { openedBy: tab.openedBy, viewport: tab.viewport }])),
+      at: Date.now(),
+    };
+    const file = join(this.options.dataDir, HANDOVER_FILE);
+    try {
+      await writeFile(file, `${JSON.stringify(handover)}\n`);
+    } catch {
+      return false;
+    }
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) if (key.startsWith('OPENCHAMBER_')) delete env[key];
+    const watchdog = spawn(process.execPath, ['-e', WATCHDOG, file, String(pid), String(handover.at + HANDOVER_MS)], { detached: true, stdio: 'ignore', env });
+    watchdog.unref();
+    this.handedOver = true;
+    this.cdp.close();
+    this.cdp = null;
+    this.child = null;
+    this.adoptedPid = null;
+    return true;
+  }
+
+  /** A browser an earlier service handed over on this profile, still running: its DevTools address, now this one's. */
+  private async adopt(): Promise<Handover | null> {
+    const file = join(this.options.dataDir, HANDOVER_FILE);
+    let handover: Handover;
+    try {
+      handover = JSON.parse(await readFile(file, 'utf8')) as Handover;
+    } catch {
+      return null;
+    }
+    // Taken, whatever comes next: the watchdog goes once the file does.
+    await rm(file, { force: true }).catch(() => {});
+    if (handover.profile !== this.profile || !Number.isInteger(handover.pid) || !alive(handover.pid) || Date.now() - handover.at > HANDOVER_MS) return null;
+    try {
+      const command = (await readFile(`/proc/${handover.pid}/cmdline`)).toString('utf8').replaceAll('\0', ' ');
+      if (!command.includes(`--user-data-dir=${this.profile}`)) return null;
+      const port = new URL(handover.ws).port;
+      const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) })).json() as { webSocketDebuggerUrl?: string };
+      if (version.webSocketDebuggerUrl !== handover.ws) return null;
+    } catch {
+      return null;
+    }
+    this.adoptedPid = handover.pid;
+    this.launchedScale = handover.scale;
+    return handover;
   }
 
   /** The connection, starting the browser when it is not running. */
@@ -520,16 +641,18 @@ export class Browser {
       this.phase = 'starting';
       this.changed();
       const seed = await profileSeed(join(this.options.dataDir, 'fingerprint-seed'));
-      await stopLeftover(this.profile);
-      const url = await this.spawnBrowser(this.binary.path, seed);
+      const handover = await this.adopt();
+      if (!handover) await stopLeftover(this.profile);
+      const url = handover?.ws ?? await this.spawnBrowser(this.binary.path, seed);
       const cdp = await Cdp.connect(url);
       this.cdp = cdp;
+      this.wsUrl = url;
       cdp.on((event) => {
         this.onEvent(event);
         for (const listener of [...this.eventListeners]) listener(event);
       });
       cdp.onClose(() => {
-        if (this.cdp !== cdp) return;
+        if (this.cdp !== cdp || this.handedOver) return;
         this.cdp = null;
         this.tabs.clear();
         this.shownId = null;
@@ -551,6 +674,30 @@ export class Browser {
       // Running from here, so the picture takes the first tab's frames; callers from outside still wait for the
       // start to end (start), and the start itself uses the calls that do not.
       this.phase = 'running';
+      if (handover) {
+        // The tabs as they were: their order, the agent's, their sizes, and the one shown.
+        const tabs = [...this.tabs.values()];
+        this.tabs.clear();
+        for (const id of handover.order) {
+          const tab = tabs.find((each) => each.id === id);
+          if (tab) this.tabs.set(id, tab);
+        }
+        for (const tab of tabs) if (!this.tabs.has(tab.id)) this.tabs.set(tab.id, tab);
+        for (const tab of this.tabs.values()) {
+          const known = handover.tabs[tab.id];
+          if (!known) continue;
+          tab.openedBy = known.openedBy;
+          if (known.viewport !== tab.viewport) {
+            tab.viewport = known.viewport;
+            void tab.ready?.then(() => this.applyViewport(tab)).catch(() => {});
+          }
+        }
+        const shown = handover.shownId && this.tabs.get(handover.shownId)?.sessionId ? handover.shownId : [...this.tabs.values()].find((tab) => tab.sessionId)?.id;
+        if (shown) {
+          await this.showNow(shown);
+          return;
+        }
+      }
       const last = await this.lastUrl();
       const open = [...this.tabs.values()].filter((tab) => tab.sessionId);
       const first = open.find((tab) => tab.url === last) ?? open.find((tab) => tab.url === 'about:blank') ?? open[0] ?? await this.newTabNow({ background: true });
@@ -566,8 +713,15 @@ export class Browser {
     }
   }
 
-  /** Starts Chrome and answers its DevTools WebSocket address, which it prints once it listens. */
-  private spawnBrowser(binary: string, seed: number): Promise<string> {
+  /**
+   * Starts Chrome and answers its DevTools WebSocket address, which it writes to the profile once it listens. Its
+   * output goes to a file, not a pipe: a browser handed over outlives this process.
+   */
+  private async spawnBrowser(binary: string, seed: number): Promise<string> {
+    const portFile = join(this.profile, 'DevToolsActivePort');
+    const logFile = join(this.options.dataDir, 'browser.log');
+    await rm(portFile, { force: true }).catch(() => {});
+    const log = openSync(logFile, 'w');
     const env = { ...process.env };
     // A session bus without a keyring stalls every request that touches cookies (with --password-store=basic too,
     // other D-Bus services can still be asked), and the browser has no business with OpenChamber's token.
@@ -589,9 +743,11 @@ export class Browser {
       `--fingerprint=${seed}`,
       '--fingerprint-platform=windows',
       'about:blank',
-    ], { stdio: ['ignore', 'ignore', 'pipe'], env });
+    ], { stdio: ['ignore', 'ignore', log], env });
+    closeSync(log);
     this.child = child;
     this.launchedScale = this.scale;
+    this.handedOver = false;
     child.on('exit', (code, signal) => {
       if (this.child !== child) return;
       this.child = null;
@@ -601,26 +757,22 @@ export class Browser {
         this.changed();
       }
     });
-    return new Promise((resolve, reject) => {
-      let stderr = '';
-      const timer = setTimeout(() => reject(new Error(`The browser did not start within 30 s. ${stderr.trim().split('\n').slice(-3).join(' ')}`)), 30_000);
-      child.stderr?.on('data', (chunk: Buffer) => {
-        stderr = (stderr + chunk.toString('utf8')).slice(-4000);
-        const match = /DevTools listening on (ws:\/\/\S+)/.exec(stderr);
-        if (match) {
-          clearTimeout(timer);
-          resolve(match[1]);
-        }
-      });
-      child.on('error', (error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
-      child.on('exit', (code, signal) => {
-        clearTimeout(timer);
-        reject(new Error(`The browser exited while starting (${signal ?? `code ${code}`}). ${stderr.trim().split('\n').slice(-3).join(' ')}`));
-      });
+    const tail = async (): Promise<string> => (await readFile(logFile, 'utf8').catch(() => '')).trim().split('\n').slice(-3).join(' ');
+    let failure: Error | null = null;
+    child.on('error', (error) => {
+      failure = error;
     });
+    child.on('exit', (code, signal) => {
+      failure ??= new Error(`The browser exited while starting (${signal ?? `code ${code}`}).`);
+    });
+    const end = Date.now() + 30_000;
+    while (Date.now() < end) {
+      if (failure) throw new Error(`${(failure as Error).message} ${await tail()}`.trim());
+      const lines = (await readFile(portFile, 'utf8').catch(() => '')).split('\n');
+      if (lines.length >= 2 && /^\d+$/.test(lines[0]) && lines[1].startsWith('/devtools/browser/')) return `ws://127.0.0.1:${lines[0]}${lines[1].trim()}`;
+      await sleep(50);
+    }
+    throw new Error(`The browser did not start within 30 s. ${await tail()}`.trim());
   }
 
   /** Resolves true on the tab's next load event, false after `timeoutMs`. */

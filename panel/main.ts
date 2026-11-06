@@ -7,6 +7,7 @@ import { applyHostReady, mountButton, mountTextField } from '@openchamber/sdk/ui
 import { MirrorView } from './mirror-view.ts';
 
 type Tab = { id: string; title: string; url: string; shown: boolean; agent: boolean; loading: boolean };
+type Controlled = { controller: 'none' | 'agent' | 'user'; mine: boolean };
 type Dialog = { type: string; message: string; defaultPrompt: string };
 type State = {
   phase: 'idle' | 'preparing' | 'starting' | 'running' | 'failed';
@@ -23,6 +24,9 @@ type State = {
   address: { seq: number } | null;
   /** The user is working in the page: the strip looks more often, so a new tab or title shows at once. */
   inUse: boolean;
+  /** Who works in the browser, said for this window (service/control.ts). */
+  control?: Controlled;
+  agentActive?: boolean;
 };
 
 // Remixicon (Apache-2.0) line icons, 24×24.
@@ -50,6 +54,8 @@ const svg = (path: string, size = 16): SVGSVGElement => {
 };
 
 const host = connectHost();
+/** This window's panel, for who holds control. Not crypto.randomUUID: OpenChamber may be served over plain HTTP. */
+const viewer = Array.from(crypto.getRandomValues(new Uint8Array(12)), (byte) => byte.toString(16).padStart(2, '0')).join('');
 const root = document.querySelector<HTMLElement>('#root');
 if (!root) throw new Error('Missing #root');
 
@@ -68,6 +74,7 @@ placeholder.className = 'placeholder';
 let pageShown = false;
 const view = new MirrorView(root, {
   host,
+  viewer,
   onShown: (shown) => {
     pageShown = shown;
     if (state) paintPlaceholder(state);
@@ -228,6 +235,22 @@ const status = document.createElement('span');
 status.className = 'status';
 toolbar.append(status);
 
+// While this window holds control, the agent's actions wait: the user hands it back here (or it ends by itself after
+// a minute without input).
+const handBackBox = document.createElement('span');
+handBackBox.className = 'hand-back';
+handBackBox.hidden = true;
+toolbar.append(handBackBox);
+mountButton(handBackBox, {
+  label: 'Hand back to agent',
+  variant: 'outline',
+  size: 'xs',
+  onClick: () => {
+    releaseFocus();
+    void host.serviceRequest({ method: 'POST', path: '/control', body: JSON.stringify({ action: 'release', viewer }) }).catch(() => {}).then(() => refresh());
+  },
+});
+
 // The page as a picture (what Cloak Browser draws), or as HTML again: for a page HTML does not show well.
 const asPicture = iconButton(toolbar, 'Show the page as a picture', ICONS.picture, () => {
   view.togglePicture();
@@ -315,6 +338,14 @@ const show = (text: string, error = false): void => {
   status.dataset.error = String(error);
 };
 
+/** Who works in the browser, in OpenChamber's words for its own surface; '' for nobody. */
+const controlText = (next: State): string => {
+  if (next.phase !== 'running') return '';
+  if (next.control?.controller === 'user') return next.control.mine ? 'You have control' : 'Another device has control';
+  if (next.control?.controller === 'agent' || next.agentActive) return 'Agent is working';
+  return '';
+};
+
 const describe = (next: State): string => {
   switch (next.phase) {
     case 'preparing': {
@@ -381,14 +412,17 @@ const paint = (next: State): void => {
       address = shown;
     }
   }
-  if (!shownError || next.phase === 'failed') show(describe(next), next.phase === 'failed');
+  handBackBox.hidden = !(next.control?.controller === 'user' && next.control.mine);
+  view.setControl(next.control?.controller === 'user' && next.control.mine);
+  status.dataset.control = next.control?.controller === 'user' && next.control.mine ? 'mine' : '';
+  if (!shownError || next.phase === 'failed') show(controlText(next) || describe(next), next.phase === 'failed');
 };
 
 const refresh = async (): Promise<void> => {
   if (busy) return;
   busy = true;
   try {
-    const result = await host.serviceRequest({ method: 'GET', path: '/state' });
+    const result = await host.serviceRequest({ method: 'GET', path: `/state?viewer=${viewer}` });
     paint(JSON.parse(result.body) as State);
   } catch {
     show('The Cloak Browser service is not running', true);
