@@ -10,7 +10,9 @@
 //   snapshot  { k: 'snap', url, title, quirks, root: Node, adopted: css, scroll: [x, y], focus: id | 0, lw: width }
 //   changes   { k: 'ops', ops: Op[] }
 // Node:  { i: id, x: text } for text; { i, n: tag, ns?: 's'|'m'|'h', a?: attrs, c?: Node[], s?: shadow Node[],
-//          sa?: shadow css, css?: style text, p?: form state, sc?: [left, top] scrolled, patch?: 1 } for elements
+//          sa?: shadow css, css?: style text, p?: form state, sc?: [left, top] scrolled, patch?: 1,
+//          is?: [width, height] an image's own size, where the page sets it none,
+//          d?: 1 a custom element the page has defined } for elements
 // Op:    ['c', parentId, (id | Node)[]]   the parent's children now, existing ones by id, new ones whole
 //        ['S', hostId, (id | Node)[]]     the same for an open shadow root
 //        ['a', id, name, value | null]    an attribute set or removed
@@ -20,6 +22,8 @@
 //        ['v', id, form state]            a form control's value
 //        ['x', id | 0, left, top]         a scroll position (0: the document)
 //        ['f', id | 0]                    the focused element (0: none)
+//        ['n', id, width, height]         an image's own size, once the page has it (for one it sets no size for)
+//        ['d', id]                        a custom element's name the page has defined since it was described
 //        ['w', width]                     the width the page lays its content out in (its window less its scroll
 //                                         bar), when it changes: the panel lays it out in the same
 //
@@ -39,6 +43,25 @@ export function mirrorRecorder(): void {
   /** Drawn by the page's code or another document: mirrored as an empty box, which a picture fills. */
   const PATCH = new Set(['canvas', 'video', 'iframe', 'embed', 'object', 'audio']);
   const URL_ATTRIBUTES = new Set(['src', 'href', 'poster', 'action', 'formaction', 'data', 'background', 'cite', 'xlink:href']);
+
+  /**
+   * The addresses the page has finished loading. The browser hands out its copy of a resource still loading (the part
+   * that has come), so the service takes the page's copy only once the load is done: resource timing makes an entry
+   * then. An observer sees every entry, also past the page's timing buffer (250 entries), and the page clearing it.
+   */
+  const finished = new Set<string>();
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) finished.add(entry.name);
+      if (finished.size > 20_000) {
+        const newest = Array.from(finished).slice(-10_000);
+        finished.clear();
+        for (const name of newest) finished.add(name);
+      }
+    }).observe({ type: 'resource', buffered: true });
+  } catch {
+    // no resource timing: the page's copy is taken when a sheet or an image of it says it has loaded (loaded)
+  }
 
   const ids = new WeakMap<Node, number>();
   const byId = new Map<number, WeakRef<Node>>();
@@ -139,12 +162,28 @@ export function mirrorRecorder(): void {
   };
 
   let observer: MutationObserver;
+  /**
+   * Images the page sets no width or height for, whose own size the page does not have yet: until the panel has the
+   * image too, its box would take no room and what follows would sit higher. Their size goes once the page has it.
+   */
+  const unsized = new Map<number, WeakRef<HTMLImageElement>>();
+  const sizeImage = (id: number, image: HTMLImageElement, out: Json): void => {
+    if (image.hasAttribute('width') && image.hasAttribute('height')) return;
+    if (image.naturalWidth > 0 && image.naturalHeight > 0) out.is = [image.naturalWidth, image.naturalHeight];
+    else unsized.set(id, new WeakRef(image));
+  };
   /** Shadow roots attached after their host was described: attaching one is no mutation, and the page's attachShadow
    * is not ours to wrap. Looked for (sweepShadows) every second on custom elements described without one (a component
    * whose definition comes later attaches its root then), and in the whole document every second for a small one,
    * every ten for a large one: the scan runs on the page's own thread. */
   const observedShadows = new WeakSet<ShadowRoot>();
   const shadowless = new Set<WeakRef<Element>>();
+  /**
+   * Custom elements and whether the page has defined their names: CSS tells the two apart (`:defined`), and the panel
+   * defines a name (as an element that does nothing) once the page has. One not defined yet is looked at each sweep.
+   */
+  const definedNames = new Set<string>();
+  const undefinedCustom = new Map<number, WeakRef<Element>>();
   /** Elements described since the last snapshot: how large the document is. */
   let described = 0;
   let lastFullShadowSweep = 0;
@@ -161,6 +200,14 @@ export function mirrorRecorder(): void {
     const ns = element.namespaceURI === SVG ? 's' : element.namespaceURI === MATH ? 'm' : null;
     // Marked where it changes: into SVG or MathML, and back to HTML (inside a foreignObject).
     if (ns !== parentNs) out.ns = ns ?? 'h';
+    if (element.namespaceURI === HTML && tag.includes('-')) {
+      if (definedNames.has(tag) || element.matches(':defined')) {
+        definedNames.add(tag);
+        out.d = 1;
+      } else {
+        undefinedCustom.set(id, new WeakRef(element));
+      }
+    }
     const attributes = attributesOf(element);
     if (element.namespaceURI === HTML) {
       if (tag === 'style') {
@@ -177,6 +224,7 @@ export function mirrorRecorder(): void {
         return out;
       }
       if (tag === 'img') {
+        sizeImage(id, element as HTMLImageElement, out);
         // The image the page chose for this width and pixel ratio: one fetch instead of every candidate.
         const image = element as HTMLImageElement;
         const chosen = image.currentSrc || image.getAttribute('src') || '';
@@ -275,6 +323,12 @@ export function mirrorRecorder(): void {
         else parents.add(record.target);
       } else if (record.type === 'attributes') {
         const element = record.target as Element;
+        // A link that became a style sheet (rel=preload, then stylesheet once loaded) was never described: its
+        // parent's children are, again.
+        if (record.attributeName === 'rel' && element.localName === 'link' && element.parentNode && !sent.has(element)) {
+          parents.add(element.parentNode);
+          continue;
+        }
         let names = attributes.get(element);
         if (!names) attributes.set(element, (names = new Set()));
         names.add(record.attributeName ?? '');
@@ -378,6 +432,31 @@ export function mirrorRecorder(): void {
       adopted = nextAdopted;
       ops.push(['A', adopted]);
     }
+    for (const [id, ref] of unsized) {
+      const image = ref.deref();
+      if (!image || !image.isConnected) {
+        unsized.delete(id);
+        continue;
+      }
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        unsized.delete(id);
+        ops.push(['n', id, image.naturalWidth, image.naturalHeight]);
+      }
+    }
+    for (const [id, ref] of undefinedCustom) {
+      const element = ref.deref();
+      if (!element || !element.isConnected) {
+        undefinedCustom.delete(id);
+        continue;
+      }
+      const name = element.localName;
+      if (!definedNames.has(name) && !element.matches(':defined')) continue;
+      undefinedCustom.delete(id);
+      // One change per name: the panel's definition takes in every element of it.
+      if (definedNames.has(name)) continue;
+      definedNames.add(name);
+      ops.push(['d', id]);
+    }
     const width = document.documentElement.clientWidth;
     if (width !== layoutWidth) {
       layoutWidth = width;
@@ -472,6 +551,9 @@ export function mirrorRecorder(): void {
     styles.clear();
     controls.clear();
     patchNodes.clear();
+    unsized.clear();
+    definedNames.clear();
+    undefinedCustom.clear();
     shadowless.clear();
     described = 0;
     adopted = adoptedText(document.adoptedStyleSheets);
@@ -606,6 +688,16 @@ export function mirrorRecorder(): void {
         out.push([id, r(left + window.scrollX), r(top + window.scrollY), r(right - left), r(bottom - top), r(left - box.left), r(top - box.top), element.localName]);
       }
       return { view: [width, height], list: out };
+    },
+    /**
+     * Whether the page has the whole of `url` (its load is done): the browser's copy of it is then the resource, not
+     * the part of it that has come so far.
+     */
+    loaded(url: string): boolean {
+      if (finished.has(url) || performance.getEntriesByName(url).length > 0) return true;
+      for (const sheet of Array.from(document.styleSheets)) if (sheet.href === url) return true;
+      for (const image of Array.from(document.images)) if (image.currentSrc === url && image.complete && image.naturalWidth > 0) return true;
+      return false;
     },
     /** Where the elements matching `selector` are, in document CSS pixels: [top, left, width, height], at most 200. */
     rects(selector: string): Array<[number, number, number, number]> {

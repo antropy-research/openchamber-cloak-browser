@@ -192,6 +192,54 @@ export function serveInContainer(name, html, port = 39123) {
   };
 }
 
+/**
+ * Files served inside the dev container, as what they are: `files` maps a path to `{ type, body }` (a string or a
+ * Buffer) and, optionally, `delay` (ms before the answer) or `chunks` (strings sent `gap` ms apart, in place of the
+ * body). Answers the base URL, the paths asked for so far in order (`requests()`), and a stop function.
+ */
+export function serveFiles(files, port) {
+  const dir = `/tmp/cloak-html-site/files-${port}`;
+  const manifest = Object.fromEntries(Object.entries(files).map(([path, file]) => [path, {
+    type: file.type,
+    delay: file.delay ?? 0,
+    gap: file.gap ?? 0,
+    chunks: (file.chunks ?? [file.body]).map((chunk) => Buffer.from(chunk).toString('base64')),
+  }]));
+  const server = `const http = require('http'), fs = require('fs');
+const files = JSON.parse(fs.readFileSync(${JSON.stringify(`${dir}/files.json`)}, 'utf8'));
+http.createServer((request, response) => {
+  const path = request.url.split('?')[0];
+  fs.appendFileSync(${JSON.stringify(`${dir}/requests.log`)}, path + '\\n');
+  const file = files[path];
+  if (!file) { response.writeHead(404); response.end(); return; }
+  setTimeout(() => {
+    response.writeHead(200, { 'content-type': file.type });
+    const send = (index) => {
+      if (index === file.chunks.length) return response.end();
+      response.write(Buffer.from(file.chunks[index], 'base64'));
+      setTimeout(() => send(index + 1), index + 1 < file.chunks.length ? file.gap : 0);
+    };
+    send(0);
+  }, file.delay);
+}).listen(${port}, '127.0.0.1');
+`;
+  inContainer(`rm -rf ${dir} && mkdir -p ${dir}`);
+  execFileSync('docker', ['exec', '-i', CONTAINER, 'sh', '-c', `cat > ${dir}/files.json`], { input: JSON.stringify(manifest) });
+  execFileSync('docker', ['exec', '-i', CONTAINER, 'sh', '-c', `cat > ${dir}/server.js`], { input: server });
+  execFileSync('docker', ['exec', '-d', CONTAINER, 'sh', '-c', `echo $$ > ${dir}/server.pid; exec node ${dir}/server.js`]);
+  return {
+    base: `http://127.0.0.1:${port}`,
+    requests: () => inContainer(`cat ${dir}/requests.log 2>/dev/null || true`).split('\n').filter(Boolean),
+    stop: () => {
+      try {
+        inContainer(`kill $(cat ${dir}/server.pid) 2>/dev/null; rm -rf ${dir}`);
+      } catch {
+        // gone already
+      }
+    },
+  };
+}
+
 /** Checks, printed as they go: `results()` answers [passed, total]. */
 export const checker = () => {
   const results = [];

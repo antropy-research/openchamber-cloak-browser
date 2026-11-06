@@ -34,6 +34,8 @@ type Desc = {
   p?: { v?: string; k?: boolean; si?: number };
   sc?: [number, number];
   patch?: 1;
+  is?: [number, number];
+  d?: 1;
 };
 type Snapshot = { k: 'snap'; url: string; title: string; quirks: boolean; root: Desc | null; adopted: string; scroll: [number, number]; focus?: number; lw?: number };
 type Op = [string, ...unknown[]];
@@ -60,7 +62,13 @@ const blobs = new Map<string, string>();
 const sheets = new Map<string, string>();
 const wanted = new Set<string>();
 const asked = new Set<string>();
-const failed = new Set<string>();
+/**
+ * Resources the service could not give: how often, and until when they are not asked for again. One still needed then
+ * (a linked sheet, an element waiting for it) is asked for again after RETRY_MS: the request may have failed on the
+ * way (the service starting again, its answer cut). What a style names is asked for when the renderer next wants it.
+ */
+const failed = new Map<string, { count: number; until: number }>();
+const RETRY_MS = [1000, 3000, 8000];
 /** Style elements and the CSS they hold (absolute url()s, @imports by address), rendered again as resources arrive. */
 const styles = new Map<Element, string>();
 /** Elements that stand for a page's linked style sheet, with its address. */
@@ -103,15 +111,19 @@ const input = startInput({
 const isRemote = (url: string): boolean => /^https?:/i.test(url);
 
 const want = (url: string): void => {
-  if (!isRemote(url) || blobs.has(url) || sheets.has(url) || asked.has(url) || failed.has(url)) return;
+  if (!isRemote(url) || blobs.has(url) || sheets.has(url) || asked.has(url)) return;
+  const failure = failed.get(url);
+  if (failure && Date.now() < failure.until) return;
   wanted.add(url);
-  wantTimer ??= setTimeout(() => {
-    wantTimer = null;
-    const urls = [...wanted];
-    wanted.clear();
-    for (const each of urls) asked.add(each);
-    if (urls.length) post({ type: 'want', urls });
-  }, 0);
+  wantTimer ??= setTimeout(flushWanted, 0);
+};
+
+const flushWanted = (): void => {
+  wantTimer = null;
+  const urls = [...wanted];
+  wanted.clear();
+  for (const each of urls) asked.add(each);
+  if (urls.length) post({ type: 'want', urls });
 };
 
 /** An address a page could run code with. Browsers ignore whitespace and control characters before the scheme. */
@@ -265,9 +277,25 @@ const patchAt = (x: number, y: number): Element | null => {
 const standIns = new WeakSet<Element>();
 const STAND_IN_KEPT = new Set(['src', 'srcdoc', 'srcset', 'data', 'sandbox', 'allow', 'allowfullscreen', 'credentialless', 'csp', 'name']);
 
+/** A linked sheet's address changed (a page's script often sets it after adding the link): its style follows. */
+const relink = (element: Element, href: string): void => {
+  linked.set(element, href);
+  const text = sheets.get(href);
+  if (text !== undefined) setCss(element, text);
+  else {
+    styles.delete(element);
+    element.textContent = '';
+    want(href);
+  }
+};
+
 const setAttribute = (element: Element, name: string, value: string | null): void => {
   // autofocus would take the keyboard from OpenChamber when a page shows (the page's own focus is the browser's).
   if (/^on/i.test(name) || name === 'srcdoc' || name === 'is' || name === 'autofocus') return;
+  if (linked.has(element) && name === 'href') {
+    relink(element, value !== null && isRemote(value) ? value : '');
+    return;
+  }
   if (standIns.has(element) && STAND_IN_KEPT.has(name.toLowerCase())) return;
   const svgAnimation = element.namespaceURI === NAMESPACES.s && ANIMATIONS.has(element.localName.toLowerCase());
   try {
@@ -359,6 +387,24 @@ const forget = (node: Node): void => {
   node.childNodes.forEach(forget);
 };
 
+/**
+ * A custom element's name the page has defined (the `d` mark, the `d` change), defined here too as an element that
+ * does nothing: the page's own definition (its code) never runs here, but CSS asks whether an element is defined
+ * (`:defined`), and pages style the two cases apart (GitHub shows another header while its components are not yet
+ * defined). A name the page has not defined stays undefined here. A definition cannot be taken back: a later page
+ * that uses the same name without defining it finds it defined.
+ */
+const defined = new Set<string>();
+const define = (name: string): void => {
+  if (!name.includes('-') || defined.has(name)) return;
+  defined.add(name);
+  try {
+    if (!customElements.get(name)) customElements.define(name, class extends HTMLElement {});
+  } catch {
+    // not a valid custom element name
+  }
+};
+
 /** Elements that would load or run something of their own: an empty stand-in with the same box. */
 const standIn = (desc: Desc): Element => {
   const made = makeStandIn(desc);
@@ -411,6 +457,7 @@ const build = (desc: Desc, parentNs: string | null): Node | null => {
     element = standIn(desc);
   } else {
     try {
+      if (ns === HTML && desc.d) define(desc.n ?? '');
       element = ns === HTML ? document.createElement(desc.n ?? 'span') : document.createElementNS(ns, desc.n ?? 'g');
     } catch {
       element = document.createElement('span');
@@ -451,7 +498,24 @@ const build = (desc: Desc, parentNs: string | null): Node | null => {
   }
   if (desc.p) applyForm(element, desc.p);
   if (desc.sc) scrolledAtStart.push([desc.i, desc.sc]);
+  if (desc.is) hintSize(element, desc.is[0], desc.is[1]);
   return element;
+};
+
+/**
+ * An image's own size (for one the page sets no size for), while the image itself is not here: a blank picture of
+ * that size stands in, so the page's CSS sizes the box as it does the image, and what follows sits where it does in
+ * the page. The image replaces it when it comes; a picture the element has already (the page's own data: one, or the
+ * image itself) is never covered.
+ */
+const placeholders = new WeakMap<Element, string>();
+const hintSize = (element: Element, width: number, height: number): void => {
+  if (!(element instanceof HTMLImageElement) || !(width > 0 && height > 0)) return;
+  const src = element.getAttribute('src');
+  if (src && src !== placeholders.get(element)) return;
+  const url = `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(width)}" height="${Math.round(height)}"/>`)}`;
+  placeholders.set(element, url);
+  element.setAttribute('src', url);
 };
 
 /**
@@ -636,6 +700,16 @@ const apply = (op: Op): boolean => {
       pageWidth = op[1] as number;
       fitWidth();
       return true;
+    case 'n': {
+      const element = nodes.get(op[1] as number);
+      if (element instanceof Element) hintSize(element, op[2] as number, op[3] as number);
+      return true;
+    }
+    case 'd': {
+      const element = nodes.get(op[1] as number);
+      if (element instanceof Element && element.namespaceURI === HTML) define(element.localName);
+      return true;
+    }
     default:
       return true;
   }
@@ -668,6 +742,7 @@ const restyle = (): void => {
 
 const resourceArrived = (url: string, mime: string, content: { data?: string; text?: string }): void => {
   asked.delete(url);
+  failed.delete(url);
   const bytes = content.text !== undefined ? content.text : Uint8Array.from(atob(content.data ?? ''), (char) => char.charCodeAt(0));
   keptBytes += typeof bytes === 'string' ? bytes.length : bytes.byteLength;
   if (mime === 'text/css') {
@@ -685,8 +760,16 @@ const resourceArrived = (url: string, mime: string, content: { data?: string; te
 
 const resourceFailed = (url: string): void => {
   asked.delete(url);
-  failed.add(url);
+  const count = (failed.get(url)?.count ?? 0) + 1;
+  const wait = RETRY_MS[count - 1];
+  const failure = { count, until: wait === undefined ? Infinity : Date.now() + wait };
+  failed.set(url, failure);
   if (held?.sheets.delete(url) && held.sheets.size === 0) release();
+  if (wait === undefined) return;
+  setTimeout(() => {
+    failure.until = 0;
+    if ([...linked.values()].includes(url) || waiting.has(url)) want(url);
+  }, wait);
 };
 
 window.addEventListener('message', (event) => {
