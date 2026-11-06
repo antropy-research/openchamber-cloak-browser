@@ -6,10 +6,10 @@
 // Chrome or Chromium (GitHub's Ubuntu runners have Google Chrome).
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { type ChildProcess, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
 import http from 'node:http';
 import { createServer } from 'node:net';
-import { homedir, tmpdir } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const ROOT = resolve(import.meta.dir, '..');
@@ -729,4 +729,22 @@ describe('the panel\'s size, when OpenChamber does not send it', () => {
     expect((await look({ 'x-surface-viewer-controls': '0' })).youControl).toBe(false);
     expect((await look()).youControl).toBe(false);
   }, 30_000);
+});
+
+describe('a profile another machine locked', () => {
+  // A container made again over the same volume has a new hostname, and Chrome refused the profile its old self had
+  // locked ("in use on another computer", exit code 21): the browser never started again.
+  test('the browser starts on a profile whose lock names another machine', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'cloak-test-'));
+    mkdirSync(join(dataDir, 'profile'), { recursive: true });
+    symlinkSync('an-old-container-4242', join(dataDir, 'profile/SingletonLock'));
+    const service = await startService(dataDir);
+    try {
+      await waitFor('the browser to run', () => state(service), (s) => s.phase === 'running', 30_000);
+      expect(readlinkSync(join(dataDir, 'profile/SingletonLock')).startsWith(`${hostname()}-`)).toBe(true);
+    } finally {
+      await stopService(service);
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

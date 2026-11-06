@@ -1,6 +1,6 @@
 {
   "name": "@oc-forge/openchamber-cloak-browser",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
   "description": "CloakBrowser in OpenChamber: a browser on the server that you and the agent share.",

@@ -36,7 +36,8 @@ Works: the browser in the panel, and the agent's browser.
   release on first use, its signed SHA256SUMS and checksum checked. Headless, with one
   profile that keeps your logins and one fingerprint across restarts. It starts when the
   panel opens and restarts after it exits; a browser left behind by a killed service is
-  stopped on the next start.
+  stopped on the next start, and a lock left on the profile by an earlier container over
+  the same volume (another hostname, which Chrome refuses) is cleared.
 - **The picture.** The shown tab at the panel's size and the window's pixel ratio
   (Retina is sharp), sent when the page changes. OpenChamber tells the service the
   panel's size only when the panel changes size, so after a restart of OpenChamber or

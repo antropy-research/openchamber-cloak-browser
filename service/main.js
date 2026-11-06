@@ -954,7 +954,8 @@ class Agent {
 // service/browser.ts
 import { spawn as spawn2 } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir as mkdir2, readFile as readFile2, readlink, writeFile as writeFile2 } from "node:fs/promises";
+import { mkdir as mkdir2, readFile as readFile2, readlink, rm as rm2, writeFile as writeFile2 } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join as join2 } from "node:path";
 
 // service/binary.ts
@@ -1214,7 +1215,12 @@ var stopLeftover = async (profile) => {
   } catch {
     return;
   }
-  const pid = Number(owner.slice(owner.lastIndexOf("-") + 1));
+  const dash = owner.lastIndexOf("-");
+  if (owner.slice(0, dash) !== hostname()) {
+    await Promise.all(["SingletonLock", "SingletonCookie", "SingletonSocket"].map((name) => rm2(join2(profile, name), { force: true }).catch(() => {})));
+    return;
+  }
+  const pid = Number(owner.slice(dash + 1));
   if (!Number.isInteger(pid) || pid <= 1 || !alive(pid))
     return;
   let command = "";

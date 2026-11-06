@@ -178,7 +178,11 @@ try {
   await step('example.com from the address field; the field follows the page', async () => {
     await go('example.com');
     const state = await waitState('Example Domain', (s) => s.url === 'https://example.com/' && s.title === 'Example Domain' && !s.loading, 30_000);
-    const shown = await field.evaluate((input) => input.value);
+    // The strip looks at the service on its own beat (once a second while the picture sits still).
+    let shown = '';
+    for (const end = Date.now() + 5000; Date.now() < end && shown !== 'https://example.com/'; await page.waitForTimeout(200)) {
+      shown = await field.evaluate((input) => input.value);
+    }
     if (shown !== 'https://example.com/') throw new Error(`the field shows ${shown}`);
     return `${state.url} "${state.title}"`;
   });

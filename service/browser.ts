@@ -4,7 +4,8 @@
 // first request that needs it and starts again after it exits.
 import { type ChildProcess, spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { mkdir, readFile, readlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readlink, rm, writeFile } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 
 import type { BrowserViewportMode, BrowserViewportSummary } from '@openchamber/sdk';
@@ -87,6 +88,10 @@ const alive = (pid: number): boolean => {
 /**
  * A Chrome left running on this profile by a service that was killed: it holds the profile's lock, and a new
  * launch would hand its window to it and exit. Stopped here, before the launch.
+ *
+ * A lock another machine left: Chrome refuses such a profile for good ("in use on another computer", exit code 21).
+ * The profile is this service's own, so that machine is this one under an old name, a container made again over the
+ * same volume (its hostname is new); the lock goes.
  */
 const stopLeftover = async (profile: string): Promise<void> => {
   let owner: string;
@@ -95,7 +100,12 @@ const stopLeftover = async (profile: string): Promise<void> => {
   } catch {
     return;
   }
-  const pid = Number(owner.slice(owner.lastIndexOf('-') + 1));
+  const dash = owner.lastIndexOf('-');
+  if (owner.slice(0, dash) !== hostname()) {
+    await Promise.all(['SingletonLock', 'SingletonCookie', 'SingletonSocket'].map((name) => rm(join(profile, name), { force: true }).catch(() => {})));
+    return;
+  }
+  const pid = Number(owner.slice(dash + 1));
   if (!Number.isInteger(pid) || pid <= 1 || !alive(pid)) return;
   let command = '';
   try {
