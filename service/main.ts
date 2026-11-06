@@ -178,6 +178,9 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
       if (!input) return send(res, 400, { ok: false, error: 'Not mirror input' });
       return command(res, () => applyMirrorInput(input, mirror, surface, control));
     }
+    case 'GET /mirror/rects':
+      // Where the page has the elements a selector matches: the journeys compare the panel's layout with it.
+      return send(res, 200, { rects: await mirror.rects(url.searchParams.get('selector') ?? '') });
     case 'POST /mirror/wake':
       // A view lost its place: the requests waiting for news are answered now, and it asks for the page again.
       mirror.wake();

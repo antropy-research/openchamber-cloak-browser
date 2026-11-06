@@ -7,7 +7,7 @@
 // outside the function.
 //
 // What goes out, as JSON:
-//   snapshot  { k: 'snap', url, title, quirks, root: Node, adopted: css, scroll: [x, y], focus: id | 0 }
+//   snapshot  { k: 'snap', url, title, quirks, root: Node, adopted: css, scroll: [x, y], focus: id | 0, lw: width }
 //   changes   { k: 'ops', ops: Op[] }
 // Node:  { i: id, x: text } for text; { i, n: tag, ns?: 's'|'m'|'h', a?: attrs, c?: Node[], s?: shadow Node[],
 //          sa?: shadow css, css?: style text, p?: form state, sc?: [left, top] scrolled, patch?: 1 } for elements
@@ -20,6 +20,8 @@
 //        ['v', id, form state]            a form control's value
 //        ['x', id | 0, left, top]         a scroll position (0: the document)
 //        ['f', id | 0]                    the focused element (0: none)
+//        ['w', width]                     the width the page lays its content out in (its window less its scroll
+//                                         bar), when it changes: the panel lays it out in the same
 //
 // The service also calls in, with the ids the panel's input names: `locate` (where on the screen the user's pointer
 // is, on the element it was over in the panel), `select` (a select's option the user picked in the panel) and
@@ -376,6 +378,11 @@ export function mirrorRecorder(): void {
       adopted = nextAdopted;
       ops.push(['A', adopted]);
     }
+    const width = document.documentElement.clientWidth;
+    if (width !== layoutWidth) {
+      layoutWidth = width;
+      ops.push(['w', width]);
+    }
     if (ops.length) queue.push({ k: 'ops', ops });
   };
 
@@ -441,6 +448,9 @@ export function mirrorRecorder(): void {
     queue.push({ k: 'ops', ops: [['v', id, JSON.parse(state)]] });
   };
 
+  /** The width the page lays its content out in: its window, less a scroll bar that takes room. */
+  let layoutWidth = 0;
+
   const scrolls = new Map<number, [number, number]>();
   let scrollTimer: ReturnType<typeof setTimeout> | null = null;
   const onScroll = (event: Event): void => {
@@ -467,6 +477,7 @@ export function mirrorRecorder(): void {
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
     lastFocus = focusedId();
+    layoutWidth = document.documentElement.clientWidth;
     return {
       k: 'snap',
       url: location.href,
@@ -476,6 +487,7 @@ export function mirrorRecorder(): void {
       adopted,
       scroll: [Math.round(window.scrollX), Math.round(window.scrollY)],
       focus: lastFocus,
+      lw: layoutWidth,
     };
   };
 
@@ -594,6 +606,14 @@ export function mirrorRecorder(): void {
         out.push([id, r(left + window.scrollX), r(top + window.scrollY), r(right - left), r(bottom - top), r(left - box.left), r(top - box.top), element.localName]);
       }
       return { view: [width, height], list: out };
+    },
+    /** Where the elements matching `selector` are, in document CSS pixels: [top, left, width, height], at most 200. */
+    rects(selector: string): Array<[number, number, number, number]> {
+      return Array.from(document.querySelectorAll(selector)).slice(0, 200).map((element) => {
+        const box = element.getBoundingClientRect();
+        const r = (value: number) => Math.round(value * 10) / 10;
+        return [r(box.top + window.scrollY), r(box.left + window.scrollX), r(box.width), r(box.height)];
+      });
     },
     /** The live node behind an id (the service maps the user's input with it). */
     node(id: number): Node | null {

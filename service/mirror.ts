@@ -199,6 +199,11 @@ export class Mirror {
     return (await this.call(doc, `scrollTo(${id}, ${left}, ${top})`)) === true;
   }
 
+  /** `GET /mirror/rects?selector=…`: where the page has the matching elements (the journeys compare the panel's). */
+  async rects(selector: string): Promise<unknown> {
+    return this.call(this.doc, `rects(${JSON.stringify(selector)})`);
+  }
+
   /** One of the recorder's calls (`__cloakMirror.<call>`), with numbers only, on the document `doc`. */
   private async call(doc: number, call: string): Promise<unknown> {
     const tab = this.tab;

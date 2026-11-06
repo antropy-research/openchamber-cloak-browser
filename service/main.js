@@ -2524,6 +2524,11 @@ function mirrorRecorder() {
       adopted = nextAdopted;
       ops.push(["A", adopted]);
     }
+    const width = document.documentElement.clientWidth;
+    if (width !== layoutWidth) {
+      layoutWidth = width;
+      ops.push(["w", width]);
+    }
     if (ops.length)
       queue.push({ k: "ops", ops });
   };
@@ -2598,6 +2603,7 @@ function mirrorRecorder() {
     entry.state = state;
     queue.push({ k: "ops", ops: [["v", id, JSON.parse(state)]] });
   };
+  let layoutWidth = 0;
   const scrolls = new Map;
   let scrollTimer = null;
   const onScroll = (event) => {
@@ -2626,6 +2632,7 @@ function mirrorRecorder() {
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
     lastFocus = focusedId();
+    layoutWidth = document.documentElement.clientWidth;
     return {
       k: "snap",
       url: location.href,
@@ -2634,7 +2641,8 @@ function mirrorRecorder() {
       root,
       adopted,
       scroll: [Math.round(window.scrollX), Math.round(window.scrollY)],
-      focus: lastFocus
+      focus: lastFocus,
+      lw: layoutWidth
     };
   };
   observer = new MutationObserver(flush);
@@ -2748,6 +2756,13 @@ function mirrorRecorder() {
         out.push([id, r(left + window.scrollX), r(top + window.scrollY), r(right - left), r(bottom - top), r(left - box.left), r(top - box.top), element.localName]);
       }
       return { view: [width, height], list: out };
+    },
+    rects(selector) {
+      return Array.from(document.querySelectorAll(selector)).slice(0, 200).map((element) => {
+        const box = element.getBoundingClientRect();
+        const r = (value) => Math.round(value * 10) / 10;
+        return [r(box.top + window.scrollY), r(box.left + window.scrollX), r(box.width), r(box.height)];
+      });
     },
     node(id) {
       return byId.get(id)?.deref() ?? null;
@@ -2877,6 +2892,9 @@ class Mirror {
   }
   async scrollTo(doc, id, left, top) {
     return await this.call(doc, `scrollTo(${id}, ${left}, ${top})`) === true;
+  }
+  async rects(selector) {
+    return this.call(this.doc, `rects(${JSON.stringify(selector)})`);
   }
   async call(doc, call) {
     const tab = this.tab;
@@ -4125,6 +4143,8 @@ var route = async (req, res) => {
         return send(res, 400, { ok: false, error: "Not mirror input" });
       return command(res, () => applyMirrorInput(input, mirror, surface, control));
     }
+    case "GET /mirror/rects":
+      return send(res, 200, { rects: await mirror.rects(url.searchParams.get("selector") ?? "") });
     case "POST /mirror/wake":
       mirror.wake();
       return send(res, 200, { ok: true });
