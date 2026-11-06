@@ -34,7 +34,7 @@ export const devBase = () => {
  * The temporary copy's browsers still running in the container (its main processes). The pattern is split so the
  * scan does not find its own shell.
  */
-export const tempBrowsers = () => inContainer(`a="oc-forge-cloak-html"; b="-test/profile"; for p in /proc/[0-9]*; do c=$(tr "\\0" " " < $p/cmdline 2>/dev/null) || continue; case "$c" in *--type=*) ;; *--headless*"$a$b"*) echo \${p#/proc/};; esac; done`).split('\n').filter(Boolean);
+export const tempBrowsers = () => inContainer(`a="oc-forge-cloak-html"; b="-test/profile"; for p in /proc/[0-9]*; do c=$( (tr "\\0" " " < $p/cmdline) 2>/dev/null) || continue; case "$c" in *--type=*) ;; *--headless*"$a$b"*) echo \${p#/proc/};; esac; done`).split('\n').filter(Boolean);
 
 /** This checkout's build, renamed, copied into the container. */
 const placeTemp = (out) => {
@@ -58,7 +58,7 @@ const placeTemp = (out) => {
   execFileSync('sh', ['-c', `tar -C ${pkg} -cf - . | docker exec -i ${CONTAINER} sh -c 'rm -rf ${TEMP.folder} && mkdir -p ${TEMP.folder} && tar -C ${TEMP.folder} -xf -'`]);
 };
 
-export async function openPanel({ temp = false, out = '/tmp/opencode/cloak-browser-e2e', viewport = { width: 1440, height: 900 }, scale = 2, page: pageUrl = '/' } = {}) {
+export async function openPanel({ temp = false, out = '/tmp/opencode/cloak-browser-e2e', viewport = { width: 1440, height: 900 }, scale = 2, page: pageUrl = '/', userAgent } = {}) {
   mkdirSync(out, { recursive: true });
   const which = temp ? TEMP : INSTALLED;
   const base = devBase();
@@ -67,7 +67,7 @@ export async function openPanel({ temp = false, out = '/tmp/opencode/cloak-brows
   if (!password) throw new Error('no UI password in secrets.env');
   if (temp) placeTemp(out);
   const browser = await chromium.launch();
-  const context = await browser.newContext({ viewport, deviceScaleFactor: scale });
+  const context = await browser.newContext({ viewport, deviceScaleFactor: scale, ...(userAgent ? { userAgent } : {}) });
   const wire = { requests: 0, bytes: 0, events: 0, eventBytes: 0, resources: 0, resourceBytes: 0, inputs: 0 };
   const problems = { csp: 0, other: [], pageErrors: [] };
   const close = async () => {

@@ -17,8 +17,10 @@
 // The panel is the parent; messages carry `cloak: true`:
 //   parent → frame  { type: 'events', doc, reset, messages }   { type: 'res', url, mime?, data? (base64) | text?, error? }
 //                   { type: 'patches', doc, patches: [{ id, mime, data, dx, dy, w, h }] }
+//                   { type: 'fonts', doc, faces, root, files }  (a Chromium-based browser only: frame-fonts.ts)
 //   frame → parent  { type: 'ready' }  { type: 'want', urls }  { type: 'resync' }  { type: 'input', doc, events }
-//                   { type: 'address' }
+//                   { type: 'address' }  { type: 'fonts', doc }
+import { applyFonts, chromium, type FontsMessage, ownSheet, rewriteFonts } from './frame-fonts.ts';
 import { startInput } from './frame-input.ts';
 
 type Desc = {
@@ -117,11 +119,14 @@ const want = (url: string): void => {
 /** An address a page could run code with. Browsers ignore whitespace and control characters before the scheme. */
 const scripted = (value: string): boolean => /^(javascript|vbscript):/i.test(value.replace(/[\u0000- ]/g, ''));
 
-/** CSS with each url() it names as a blob URL when that is here; others stay, and are asked for when used. */
-const renderCss = (css: string): string => css.replace(/url\("([^"]+)"\)/g, (match, url: string) => {
+/**
+ * CSS with each url() it names as a blob URL when that is here (others stay, and are asked for when used), and, in a
+ * Chromium-based browser, the browser's own fonts first (frame-fonts.ts).
+ */
+const renderCss = (css: string): string => rewriteFonts(css.replace(/url\("([^"]+)"\)/g, (match, url: string) => {
   const blob = blobs.get(url);
   return blob ? `url("${blob}")` : match;
-});
+}));
 
 /** @imports of sheets fetched by address, put in place (their own imports too, a few levels deep). */
 const withImports = (css: string, depth = 0): string => css.replace(/@import\s+url\("([^"]+)"\)\s*([^;]*);/g, (_match, url: string, media: string) => {
@@ -152,7 +157,32 @@ const sheet = (css: string): CSSStyleSheet => {
 
 const setAdopted = (css: string): void => {
   pageAdopted = css;
-  document.adoptedStyleSheets = css ? [sheet(css)] : [];
+  document.adoptedStyleSheets = [...(css ? [sheet(css)] : []), ownSheet];
+};
+
+/** The browser's fonts arrived (frame-fonts.ts): every style the page has, rendered again with them. */
+const restyleAll = (): void => {
+  for (const [element, css] of styles) element.textContent = renderCss(withImports(css));
+  for (const [element, css] of styleAttributes) {
+    element.setAttribute('style', renderCss(css));
+    const id = ids.get(element);
+    const picture = id === undefined ? undefined : patchPictures.get(id);
+    if (picture) paintPatch(element, picture);
+  }
+  setAdopted(pageAdopted);
+  for (const [root, css] of shadowCss) if (css) root.adoptedStyleSheets = [sheet(css)];
+};
+
+/** In a Chromium-based browser: the fonts the browser drew this page with, asked for again while the page changes. */
+let fontAsks = { doc: -1, count: 0, at: 0 };
+const askFonts = (): void => {
+  if (!chromium) return;
+  const now = Date.now();
+  if (fontAsks.doc !== shownDoc) fontAsks = { doc: shownDoc, count: 0, at: 0 };
+  if (fontAsks.count >= 6 || now - fontAsks.at < 5000) return;
+  fontAsks.count += 1;
+  fontAsks.at = now;
+  post({ type: 'fonts', doc: shownDoc });
 };
 
 const resourceAttribute = (element: Element, name: string): boolean => {
@@ -531,6 +561,7 @@ const showSnapshot = (message: Snapshot, doc: number): void => {
     const element = nodes.get(id);
     if (element instanceof Element) paintPatch(element, picture);
   }
+  askFonts();
   if (message.focus) input.pageFocused(message.focus);
 };
 
@@ -670,9 +701,16 @@ window.addEventListener('message', (event) => {
       else if (kind === 'ops') {
         const ops = (message as { ops: Op[] }).ops;
         if (held) held.after.push(ops);
-        else applyOps(ops);
+        else {
+          applyOps(ops);
+          // New text may ask for fonts the plan did not have yet.
+          askFonts();
+        }
       }
     }
+  } else if (data.type === 'fonts') {
+    const fonts = data as FontsMessage;
+    if (fonts.doc === shownDoc && applyFonts(fonts)) restyleAll();
   } else if (data.type === 'patches' && Array.isArray((data as { patches?: unknown }).patches)) {
     patchesArrived(data.doc ?? 0, (data as unknown as { patches: Array<{ id: number; mime: string; data: string; dx: number; dy: number; w: number; h: number }> }).patches);
   } else if (data.type === 'res' && data.url) {

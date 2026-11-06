@@ -14,6 +14,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import type { Browser, Tab } from './browser.ts';
+import { type FontFile, Fonts } from './fonts.ts';
 import { mirrorRecorder } from './mirror-recorder.ts';
 
 const RECORDER = `(${mirrorRecorder.toString()})();`;
@@ -70,6 +71,15 @@ export type MirrorAnswer = {
   /** How much of the window those elements take (0 to 1): past half, the panel shows the page as a picture. */
   coverage: number;
 };
+/**
+ * A font the page asks for (its computed font-family, weight and style) and the file of the system font the browser
+ * drew it with (fonts.ts): what a panel in a Chromium-based browser draws it with too.
+ */
+export type FontFace = { stack: string; weight: string; style: string; file: number };
+/** A plan is asked for again after this long (the page may show new text): the answer is kept meanwhile. */
+const FONT_PLAN_MS = 3000;
+/** One answer's font files, base64 included. */
+const FONT_FILES_BYTES_MAX = 6_000_000;
 /** A picture of the part of element `id` the window shows: `w`×`h` CSS pixels from (`dx`, `dy`) in its border box. */
 export type Patch = { id: number; seq: number; mime: string; data: string; dx: number; dy: number; w: number; h: number };
 type Resource = { mime: string; data: string };
@@ -112,6 +122,10 @@ export class Mirror {
    * only, and a panel that lacks one asks for it.
    */
   private readonly sheetsSent = new Set<string>();
+  private readonly fonts = new Fonts();
+  private fontPlanned: { doc: number; at: number; plan: Promise<{ faces: FontFace[]; root: string }> } | null = null;
+  /** Sessions with the DOM and CSS domains on (for CSS.getPlatformFontsForNode). */
+  private readonly cssSessions = new Set<string>();
 
   constructor(private readonly browser: Browser) {
     browser.onShown((tab) => this.retarget(tab));
@@ -197,6 +211,77 @@ export class Mirror {
   /** A scroll the panel made that the page did not. */
   async scrollTo(doc: number, id: number, left: number, top: number): Promise<boolean> {
     return (await this.call(doc, `scrollTo(${id}, ${left}, ${top})`)) === true;
+  }
+
+  /**
+   * `GET /mirror/fonts?doc=n`: per font the page asks for, the system font the browser drew it with (a panel in a
+   * Chromium-based browser draws the page with them: fonts.ts). Web fonts are not in it: the panel has them already.
+   */
+  async fontPlan(doc: number): Promise<{ faces: FontFace[]; root: string }> {
+    if (doc !== this.doc) return { faces: [], root: '' };
+    const now = Date.now();
+    if (this.fontPlanned?.doc === doc && now - this.fontPlanned.at < FONT_PLAN_MS) return this.fontPlanned.plan;
+    const plan = Promise.all([this.planFonts(doc).catch(() => []), this.call(doc, 'rootFont()')]).then(([faces, root]) => ({ faces, root: typeof root === 'string' ? root : '' }));
+    this.fontPlanned = { doc, at: now, plan };
+    return plan;
+  }
+
+  private async planFonts(doc: number): Promise<FontFace[]> {
+    const tab = this.tab;
+    const cdp = this.browser.cdp;
+    const contextId = this.contextId;
+    const session = tab?.sessionId;
+    if (!cdp || !session || contextId === null) return [];
+    const stacks = await this.call(doc, 'fontStacks()');
+    if (!Array.isArray(stacks)) return [];
+    if (!this.cssSessions.has(session)) {
+      await cdp.send('DOM.enable', {}, session);
+      await cdp.send('CSS.enable', {}, session);
+      this.cssSessions.add(session);
+    }
+    await cdp.send('DOM.getDocument', { depth: 0 }, session);
+    const faces: FontFace[] = [];
+    for (const [stack, weight, style, index] of stacks as Array<[string, string, string, number]>) {
+      if (doc !== this.doc) return [];
+      const probe = await cdp.send<{ result?: { objectId?: string } }>('Runtime.evaluate', { expression: `globalThis.__cloakMirror.fontProbe(${Number(index)})`, contextId, returnByValue: false }, session).catch(() => null);
+      const objectId = probe?.result?.objectId;
+      if (!objectId) continue;
+      try {
+        const { nodeId } = await cdp.send<{ nodeId: number }>('DOM.requestNode', { objectId }, session);
+        const { fonts } = await cdp.send<{ fonts: Array<{ familyName: string; postScriptName?: string; isCustomFont: boolean; glyphCount: number }> }>('CSS.getPlatformFontsForNode', { nodeId }, session);
+        // The font that drew most of the text, of those that can be sent (a CJK fallback is not).
+        for (const font of fonts.filter((each) => !each.isCustomFont).sort((a, b) => b.glyphCount - a.glyphCount)) {
+          const file = await this.fonts.find(font.postScriptName ?? '', font.familyName, weight, style);
+          if (file === null) continue;
+          faces.push({ stack, weight, style, file });
+          break;
+        }
+      } catch {
+        // the element went away meanwhile
+      } finally {
+        void cdp.send('Runtime.releaseObject', { objectId }, session).catch(() => {});
+      }
+    }
+    return faces;
+  }
+
+  /** `POST /mirror/fonts/files`: the font files by number, as far as one answer holds them. */
+  async fontFiles(ids: number[]): Promise<Record<number, FontFile>> {
+    const out: Record<number, FontFile> = {};
+    let bytes = 0;
+    for (const id of ids) {
+      const file = await this.fonts.file(id);
+      if (!file) continue;
+      if (bytes && bytes + file.data.length > FONT_FILES_BYTES_MAX) break;
+      out[id] = file;
+      bytes += file.data.length;
+    }
+    return out;
+  }
+
+  /** `GET /mirror/rects?selector=…`: where the page has the matching elements (to compare the panel's layout). */
+  async rects(selector: string): Promise<unknown> {
+    return this.call(this.doc, `rects(${JSON.stringify(selector)})`);
   }
 
   /** One of the recorder's calls (`__cloakMirror.<call>`), with numbers only, on the document `doc`. */

@@ -2158,6 +2158,64 @@ class Control {
 // service/mirror.ts
 import { createHash as createHash2, randomUUID } from "node:crypto";
 
+// service/fonts.ts
+import { execFile } from "node:child_process";
+import { readFile as readFile3, stat } from "node:fs/promises";
+var FONT_BYTES_MAX = 3000000;
+var run = (command, args) => new Promise((resolve) => {
+  execFile(command, args, { maxBuffer: 16000000, timeout: 1e4 }, (error, stdout) => resolve(error ? "" : stdout));
+});
+
+class Fonts {
+  table = null;
+  sizes = new Map;
+  cache = new Map;
+  entries() {
+    this.table ??= run("fc-list", ["--format", `%{file}	%{family}	%{style}	%{postscriptname}
+`]).then((text) => text.split(`
+`).filter(Boolean).map((line) => {
+      const [file, families = "", styles = "", postscript = ""] = line.split("\t");
+      return { file, families: families.split(","), styles: styles.split(","), postscript };
+    }).filter((entry) => /\.(ttf|otf)$/i.test(entry.file)).sort((a, b) => a.file.localeCompare(b.file)));
+    return this.table;
+  }
+  async find(postScriptName, familyName, weight, style) {
+    const entries = await this.entries();
+    let index = postScriptName ? entries.findIndex((entry) => entry.postscript === postScriptName) : -1;
+    if (index === -1) {
+      const bold = Number(weight) >= 600;
+      const italic = style !== "normal";
+      const wanted = bold ? italic ? "bold italic" : "bold" : italic ? "italic" : "regular";
+      const family = familyName.toLowerCase();
+      index = entries.findIndex((entry) => entry.families.some((name) => name.toLowerCase() === family) && entry.styles.some((name) => name.toLowerCase() === wanted));
+      if (index === -1)
+        index = entries.findIndex((entry) => entry.families.some((name) => name.toLowerCase() === family));
+    }
+    if (index === -1)
+      return null;
+    let size = this.sizes.get(index);
+    if (size === undefined) {
+      size = await stat(entries[index].file).then((info) => info.size).catch(() => Infinity);
+      this.sizes.set(index, size);
+    }
+    return size <= FONT_BYTES_MAX ? index : null;
+  }
+  async file(index) {
+    const cached = this.cache.get(index);
+    if (cached)
+      return cached;
+    const entry = (await this.entries())[index];
+    if (!entry || (this.sizes.get(index) ?? Infinity) > FONT_BYTES_MAX)
+      return null;
+    const bytes = await readFile3(entry.file).catch(() => null);
+    if (!bytes)
+      return null;
+    const font = { mime: /\.otf$/i.test(entry.file) ? "font/otf" : "font/ttf", data: bytes.toString("base64") };
+    this.cache.set(index, font);
+    return font;
+  }
+}
+
 // service/mirror-recorder.ts
 function mirrorRecorder() {
   const world = window;
@@ -2174,6 +2232,7 @@ function mirrorRecorder() {
   const sent = new WeakSet;
   const detached = new WeakSet;
   const styles = new Map;
+  let fontProbes = [];
   const patchNodes = new Map;
   const controls = new Map;
   let nextId = 1;
@@ -2749,6 +2808,42 @@ function mirrorRecorder() {
       }
       return { view: [width, height], list: out };
     },
+    fontStacks() {
+      const out = [];
+      const seen = new Set;
+      fontProbes = [];
+      let looked = 0;
+      const walker = document.createTreeWalker(document.body ?? document.documentElement, NodeFilter.SHOW_TEXT);
+      let last = null;
+      for (let node = walker.nextNode();node && looked < 6000 && out.length < 60; node = walker.nextNode()) {
+        const element = node.parentElement;
+        if (!element || element === last || !node.data.trim())
+          continue;
+        last = element;
+        looked += 1;
+        const style = getComputedStyle(element);
+        const key = `${style.fontFamily}|${style.fontWeight}|${style.fontStyle}`;
+        if (seen.has(key))
+          continue;
+        seen.add(key);
+        fontProbes.push(element);
+        out.push([style.fontFamily, style.fontWeight, style.fontStyle, fontProbes.length - 1]);
+      }
+      return out;
+    },
+    rootFont() {
+      return getComputedStyle(document.documentElement).fontFamily;
+    },
+    fontProbe(index) {
+      return fontProbes[index] ?? null;
+    },
+    rects(selector) {
+      return Array.from(document.querySelectorAll(selector)).slice(0, 200).map((element) => {
+        const box = element.getBoundingClientRect();
+        const r = (value) => Math.round(value * 10) / 10;
+        return [r(box.top + window.scrollY), r(box.left + window.scrollX), r(box.width), r(box.height)];
+      });
+    },
     node(id) {
       return byId.get(id)?.deref() ?? null;
     },
@@ -2777,6 +2872,8 @@ var INLINE_CSS_BYTES_MAX = 2000000;
 var INLINE_CSS_WAIT_MS = 2000;
 var PATCH_BYTES_MAX = 2000000;
 var PATCH_QUALITY = 75;
+var FONT_PLAN_MS = 3000;
+var FONT_FILES_BYTES_MAX = 6000000;
 var isText2 = (mime) => mime === "text/css" || mime === "image/svg+xml" || mime.startsWith("text/");
 var sleep3 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -2803,6 +2900,9 @@ class Mirror {
   tooBig = false;
   patchesWantedAt = 0;
   sheetsSent = new Set;
+  fonts = new Fonts;
+  fontPlanned = null;
+  cssSessions = new Set;
   constructor(browser) {
     this.browser = browser;
     browser.onShown((tab) => this.retarget(tab));
@@ -2877,6 +2977,73 @@ class Mirror {
   }
   async scrollTo(doc, id, left, top) {
     return await this.call(doc, `scrollTo(${id}, ${left}, ${top})`) === true;
+  }
+  async fontPlan(doc) {
+    if (doc !== this.doc)
+      return { faces: [], root: "" };
+    const now = Date.now();
+    if (this.fontPlanned?.doc === doc && now - this.fontPlanned.at < FONT_PLAN_MS)
+      return this.fontPlanned.plan;
+    const plan = Promise.all([this.planFonts(doc).catch(() => []), this.call(doc, "rootFont()")]).then(([faces, root]) => ({ faces, root: typeof root === "string" ? root : "" }));
+    this.fontPlanned = { doc, at: now, plan };
+    return plan;
+  }
+  async planFonts(doc) {
+    const tab = this.tab;
+    const cdp = this.browser.cdp;
+    const contextId = this.contextId;
+    const session = tab?.sessionId;
+    if (!cdp || !session || contextId === null)
+      return [];
+    const stacks = await this.call(doc, "fontStacks()");
+    if (!Array.isArray(stacks))
+      return [];
+    if (!this.cssSessions.has(session)) {
+      await cdp.send("DOM.enable", {}, session);
+      await cdp.send("CSS.enable", {}, session);
+      this.cssSessions.add(session);
+    }
+    await cdp.send("DOM.getDocument", { depth: 0 }, session);
+    const faces = [];
+    for (const [stack, weight, style, index] of stacks) {
+      if (doc !== this.doc)
+        return [];
+      const probe = await cdp.send("Runtime.evaluate", { expression: `globalThis.__cloakMirror.fontProbe(${Number(index)})`, contextId, returnByValue: false }, session).catch(() => null);
+      const objectId = probe?.result?.objectId;
+      if (!objectId)
+        continue;
+      try {
+        const { nodeId } = await cdp.send("DOM.requestNode", { objectId }, session);
+        const { fonts } = await cdp.send("CSS.getPlatformFontsForNode", { nodeId }, session);
+        for (const font of fonts.filter((each) => !each.isCustomFont).sort((a, b) => b.glyphCount - a.glyphCount)) {
+          const file = await this.fonts.find(font.postScriptName ?? "", font.familyName, weight, style);
+          if (file === null)
+            continue;
+          faces.push({ stack, weight, style, file });
+          break;
+        }
+      } catch {} finally {
+        cdp.send("Runtime.releaseObject", { objectId }, session).catch(() => {});
+      }
+    }
+    return faces;
+  }
+  async fontFiles(ids) {
+    const out = {};
+    let bytes = 0;
+    for (const id of ids) {
+      const file = await this.fonts.file(id);
+      if (!file)
+        continue;
+      if (bytes && bytes + file.data.length > FONT_FILES_BYTES_MAX)
+        break;
+      out[id] = file;
+      bytes += file.data.length;
+    }
+    return out;
+  }
+  async rects(selector) {
+    return this.call(this.doc, `rects(${JSON.stringify(selector)})`);
   }
   async call(doc, call) {
     const tab = this.tab;
@@ -4125,6 +4292,15 @@ var route = async (req, res) => {
         return send(res, 400, { ok: false, error: "Not mirror input" });
       return command(res, () => applyMirrorInput(input, mirror, surface, control));
     }
+    case "GET /mirror/fonts":
+      return send(res, 200, await mirror.fontPlan(Number(url.searchParams.get("doc")) || 0));
+    case "POST /mirror/fonts/files": {
+      const body = await readJson(req);
+      const ids = Array.isArray(body?.ids) ? body.ids.filter((id) => Number.isInteger(id) && id >= 0).slice(0, 50) : [];
+      return send(res, 200, { files: await mirror.fontFiles(ids) });
+    }
+    case "GET /mirror/rects":
+      return send(res, 200, { rects: await mirror.rects(url.searchParams.get("selector") ?? "") });
     case "POST /mirror/wake":
       mirror.wake();
       return send(res, 200, { ok: true });

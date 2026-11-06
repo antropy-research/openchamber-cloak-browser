@@ -178,6 +178,17 @@ const route = async (req: http.IncomingMessage, res: http.ServerResponse): Promi
       if (!input) return send(res, 400, { ok: false, error: 'Not mirror input' });
       return command(res, () => applyMirrorInput(input, mirror, surface, control));
     }
+    case 'GET /mirror/fonts':
+      // The fonts the browser drew the page with, for a panel in a Chromium-based browser (fonts.ts).
+      return send(res, 200, await mirror.fontPlan(Number(url.searchParams.get('doc')) || 0));
+    case 'POST /mirror/fonts/files': {
+      const body = await readJson(req);
+      const ids = Array.isArray(body?.ids) ? body.ids.filter((id): id is number => Number.isInteger(id) && (id as number) >= 0).slice(0, 50) : [];
+      return send(res, 200, { files: await mirror.fontFiles(ids) });
+    }
+    case 'GET /mirror/rects':
+      // Where the page has the elements a selector matches: the journeys compare the panel's layout with it.
+      return send(res, 200, { rects: await mirror.rects(url.searchParams.get('selector') ?? '') });
     case 'POST /mirror/wake':
       // A view lost its place: the requests waiting for news are answered now, and it asks for the page again.
       mirror.wake();

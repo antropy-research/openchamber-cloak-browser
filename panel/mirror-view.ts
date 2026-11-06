@@ -208,6 +208,9 @@ export class MirrorView {
       case 'address':
         this.onAddress();
         return;
+      case 'fonts':
+        if (typeof message.doc === 'number') void this.sendFonts(message.doc);
+        return;
       case 'resync': {
         // The frame could not apply a change (a node it does not have): the page again, whole. The request waiting
         // for news is answered at once, so the next one asks for the page. A page this keeps happening on is shown
@@ -292,6 +295,31 @@ export class MirrorView {
   setControl(mine: boolean): void {
     if (!mine && Date.now() - this.actedAt < 1500) return;
     this.mine = mine;
+  }
+
+  /** Font files this frame has been given (it keeps them across pages). */
+  private readonly fontFilesSent = new Set<number>();
+
+  /**
+   * The frame asks, in a Chromium-based browser, for the fonts the browser drew the page with (service/fonts.ts): the
+   * plan, and the files it lacks.
+   */
+  private async sendFonts(doc: number): Promise<void> {
+    try {
+      const planned = await this.host.serviceRequest({ method: 'GET', path: `/mirror/fonts?doc=${doc}` });
+      const plan = JSON.parse(planned.body) as { faces?: Array<{ file: number }>; root?: string };
+      const faces = plan.faces ?? [];
+      const missing = [...new Set(faces.map((face) => face.file))].filter((id) => !this.fontFilesSent.has(id));
+      let files: Record<string, unknown> = {};
+      if (missing.length) {
+        const answer = await this.host.serviceRequest({ method: 'POST', path: '/mirror/fonts/files', body: JSON.stringify({ ids: missing }) });
+        files = (JSON.parse(answer.body) as { files?: Record<string, unknown> }).files ?? {};
+        for (const id of Object.keys(files)) this.fontFilesSent.add(Number(id));
+      }
+      this.toFrame({ type: 'fonts', doc, faces, root: plan.root ?? '', files });
+    } catch {
+      // the panel keeps its own fonts for this page
+    }
   }
 
   private queueInput(batch: InputBatch): void {

@@ -45,6 +45,8 @@ export function mirrorRecorder(): void {
   /** Nodes removed from the page since they were sent: described whole again if they come back. */
   const detached = new WeakSet<Node>();
   const styles = new Map<number, { node: WeakRef<Element>; rules: number }>();
+  /** fontStacks's elements, one per font asked for. */
+  let fontProbes: Element[] = [];
   /** Elements the panel shows as pictures (canvas, video, frames, plugins): the service captures them (`patches`). */
   const patchNodes = new Map<number, WeakRef<Element>>();
   const controls = new Map<number, { node: WeakRef<Element>; state: string }>();
@@ -594,6 +596,48 @@ export function mirrorRecorder(): void {
         out.push([id, r(left + window.scrollX), r(top + window.scrollY), r(right - left), r(bottom - top), r(left - box.left), r(top - box.top), element.localName]);
       }
       return { view: [width, height], list: out };
+    },
+    /**
+     * The fonts the page's text asks for: each distinct computed font-family, weight and style among elements with text
+     * of their own, with one element showing it (kept in `fontProbes` for the service to ask the browser which font it
+     * drew it with). At most 60, from at most 6000 elements: the scan runs on the page's thread.
+     */
+    fontStacks(): Array<[string, string, string, number]> {
+      const out: Array<[string, string, string, number]> = [];
+      const seen = new Set<string>();
+      fontProbes = [];
+      let looked = 0;
+      const walker = document.createTreeWalker(document.body ?? document.documentElement, NodeFilter.SHOW_TEXT);
+      let last: Element | null = null;
+      for (let node = walker.nextNode(); node && looked < 6000 && out.length < 60; node = walker.nextNode()) {
+        const element = node.parentElement;
+        if (!element || element === last || !(node as Text).data.trim()) continue;
+        last = element;
+        looked += 1;
+        const style = getComputedStyle(element);
+        const key = `${style.fontFamily}|${style.fontWeight}|${style.fontStyle}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        fontProbes.push(element);
+        out.push([style.fontFamily, style.fontWeight, style.fontStyle, fontProbes.length - 1]);
+      }
+      return out;
+    },
+    /** The font text gets where the page sets none (the browser's default): the document element's. */
+    rootFont(): string {
+      return getComputedStyle(document.documentElement).fontFamily;
+    },
+    /** One of `fontStacks`'s elements (the service takes it as a remote object). */
+    fontProbe(index: number): Element | null {
+      return fontProbes[index] ?? null;
+    },
+    /** Where the elements matching `selector` are, in document CSS pixels: [top, left, width, height], at most 200. */
+    rects(selector: string): Array<[number, number, number, number]> {
+      return Array.from(document.querySelectorAll(selector)).slice(0, 200).map((element) => {
+        const box = element.getBoundingClientRect();
+        const r = (value: number) => Math.round(value * 10) / 10;
+        return [r(box.top + window.scrollY), r(box.left + window.scrollX), r(box.width), r(box.height)];
+      });
     },
     /** The live node behind an id (the service maps the user's input with it). */
     node(id: number): Node | null {
