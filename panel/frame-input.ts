@@ -75,6 +75,9 @@ export const startInput = (hooks: InputHooks) => {
   let composing = false;
   /** The character the last key sent typed, and when: its own input event is not sent again as text. */
   let keyText: { text: string; at: number } | null = null;
+  /** The page's latest focus, applied once a click here has had its moment (pageFocused). */
+  let pageFocus = 0;
+  let focusTimer: ReturnType<typeof setTimeout> | null = null;
 
   const scroller = (id: number): Element | null => {
     if (id === 0) return document.scrollingElement ?? document.documentElement;
@@ -294,9 +297,21 @@ export const startInput = (hooks: InputHooks) => {
     reapply(): void {
       for (const [id, [left, top]] of pagePos) if (!localAt.has(id)) scrollHere(id, left, top);
     },
-    /** The page's focus moved: the same element here, unless the user just put the focus somewhere. */
+    /**
+     * The page's focus moved: the same element here. Right after the user put the focus somewhere here it waits until
+     * FOCUS_HOLD_MS have passed (the page may not have the click yet), then follows the page's latest.
+     */
     pageFocused(id: number): void {
-      if (Date.now() - lastPressAt < FOCUS_HOLD_MS) return;
+      pageFocus = id;
+      const wait = FOCUS_HOLD_MS - (Date.now() - lastPressAt);
+      if (wait > 0) {
+        if (focusTimer) clearTimeout(focusTimer);
+        focusTimer = setTimeout(() => {
+          focusTimer = null;
+          this.pageFocused(pageFocus);
+        }, wait);
+        return;
+      }
       if (id === 0) {
         const current = focused();
         if (current instanceof HTMLElement && current !== document.body) current.blur();

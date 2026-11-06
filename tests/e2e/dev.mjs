@@ -169,9 +169,12 @@ try {
   });
   await sleep(600);
   await shoot('3-typed.png');
-  await step('the strip says the user has control, with "Hand back to agent"', async () => {
-    await panel.locator('.hand-back').waitFor({ timeout: 5000 });
-    return await status();
+  // With no agent around, who holds control means nothing to someone browsing: the strip says nothing of it.
+  await step('just browsing, the strip says nothing about control', async () => {
+    await sleep(1500);
+    const said = await status();
+    if (said === 'You have control' || await panel.locator('.hand-back').isVisible()) throw new Error(`the strip says "${said}" and offers to hand back`);
+    return said || '(nothing)';
   });
 
   // OpenChamber stops a browser provider ten minutes after the agent's last action, whoever is browsing: the
@@ -256,11 +259,6 @@ try {
     await message.waitFor({ state: 'hidden', timeout: 5000 });
     return `the dialog said "${text}"`;
   });
-  await step('hand back to the agent', async () => {
-    await panel.locator('.hand-back button').click();
-    await panel.locator('.hand-back').waitFor({ state: 'hidden', timeout: 5000 });
-    return (await status()) || '(nobody holds control)';
-  });
 
   // The agent's side: OpenChamber's own browser actions, answered by CloakBrowser.
   await step('Cloak Browser is the Browser provider (Settings → OpenChamber Tools)', async () => {
@@ -272,6 +270,22 @@ try {
     const after = (await (await context.request.get(`${base}/api/config/settings`)).json()).browserProvider;
     if (after !== ID) throw new Error(`browserProvider is ${after}`);
     return `was ${providerBefore}, now ${after}`;
+  });
+  // The user has just clicked in the page: they hold control (for a minute without input). The agent's first action
+  // waits for them, and from then on the strip says so and offers to hand back.
+  await step('the agent\'s first action waits for the user, and the strip offers to hand back', async () => {
+    let refused = '';
+    try {
+      await control('browser.snapshot', {});
+    } catch (error) {
+      refused = error.message;
+    }
+    if (!/interacting with this page/.test(refused)) throw new Error(`the agent's action ${refused ? `failed otherwise: ${refused.slice(0, 120)}` : 'ran'}`);
+    await panel.locator('.hand-back').waitFor({ timeout: 5000 });
+    const said = await status();
+    await panel.locator('.hand-back button').click();
+    await panel.locator('.hand-back').waitFor({ state: 'hidden', timeout: 5000 });
+    return `"${said}", then handed back`;
   });
   let agentTab = null;
   await step('browser.open: a tab behind, marked as the agent\'s; the user\'s page stays', async () => {

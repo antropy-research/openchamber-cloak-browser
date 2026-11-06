@@ -34,6 +34,10 @@ canvas.addEventListener('click', (e) => { document.getElementById('said').textCo
 addEventListener('keydown', (e) => { document.getElementById('keys').textContent += e.key; });
 </script></body></html>`;
 
+/** A document too large to send as HTML (a snapshot of about 8 MB). */
+const HUGE = `<!doctype html><html><head><meta charset="utf-8"><title>huge page</title></head><body><p id="top">rows below</p>
+<script>const rows = document.createDocumentFragment(); for (let i = 0; i < 120000; i += 1) { const row = document.createElement('div'); row.className = 'row'; row.textContent = 'row ' + i; rows.append(row); } document.body.append(rows);</script></body></html>`;
+
 const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
@@ -42,6 +46,7 @@ const check = (name, ok, detail = '') => {
 
 const inner = serveInContainer('inner', INNER, 39124);
 const full = serveInContainer('fullcanvas', FULL, 39125);
+const huge = serveInContainer('huge', HUGE, 39126);
 const outer = serveInContainer('patches', OUTER, 39123);
 const t = await openPanel({ temp: !process.argv.includes('--installed'), out: OUT });
 try {
@@ -100,6 +105,13 @@ try {
   await t.go(outer.url);
   const back = await t.waitMirror(async (frame) => (await frame.evaluate(() => document.title)) === 'patch test' && !(await pictureShown()), 10_000);
   check('the next page starts as HTML again', back >= 0);
+  // A page too large to send as HTML (it would not fit one of OpenChamber's answers): shown as a picture.
+  await t.go(huge.url);
+  const pictured = await t.waitMirror(async () => (await t.service('GET', '/state')).title === 'huge page' && await pictureShown(), 30_000);
+  check('a page too large to send as HTML is shown as a picture', pictured >= 0, `${pictured} ms`);
+  await t.go(outer.url);
+  const html2 = await t.waitMirror(async (frame) => (await frame.evaluate(() => document.title)) === 'patch test' && !(await pictureShown()), 15_000);
+  check('… and the next page is HTML again', html2 >= 0);
 
   log('wire', JSON.stringify(t.wire), 'console: CSP refusals', t.problems.csp, 'other', t.problems.other.filter((line) => !line.includes('source-control')).length);
   for (const line of t.problems.other.filter((each) => !each.includes('source-control') && !each.includes('422')).slice(0, 10)) log('  ', line);
@@ -108,6 +120,7 @@ try {
   outer.stop();
   inner.stop();
   full.stop();
+  huge.stop();
 }
 const failed = results.filter((result) => !result.ok);
 log(`${results.length - failed.length}/${results.length} passed`);

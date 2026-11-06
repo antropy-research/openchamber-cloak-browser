@@ -30,6 +30,12 @@ export const devBase = () => {
   return `http://${host === '0.0.0.0' || host === '[::]' ? '127.0.0.1' : host}:${published.slice(at + 1)}`;
 };
 
+/**
+ * The temporary copy's browsers still running in the container (its main processes). The pattern is split so the
+ * scan does not find its own shell.
+ */
+export const tempBrowsers = () => inContainer(`a="oc-forge-cloak-html"; b="-test/profile"; for p in /proc/[0-9]*; do c=$(tr "\\0" " " < $p/cmdline 2>/dev/null) || continue; case "$c" in *--type=*) ;; *--headless*"$a$b"*) echo \${p#/proc/};; esac; done`).split('\n').filter(Boolean);
+
 /** This checkout's build, renamed, copied into the container. */
 const placeTemp = (out) => {
   const pkg = join(out, 'pkg');
@@ -71,6 +77,17 @@ export async function openPanel({ temp = false, out = '/tmp/opencode/cloak-brows
         inContainer(`rm -rf ${TEMP.folder} ${TEMP.data}`);
       } catch {
         // gone already
+      }
+      // Removed while its panel was shown, the service handed its browser over; with the handover gone, its watchdog
+      // stops it at once (browser.ts). One still running after that is a leak: said, and stopped here.
+      let left = tempBrowsers();
+      for (let wait = 0; wait < 20 && left.length; wait += 1) {
+        await sleep(500);
+        left = tempBrowsers();
+      }
+      if (left.length) {
+        log(`LEAK: the temporary copy's browser still runs (${left.join(', ')}); stopping it`);
+        inContainer(`kill -KILL ${left.map(Number).join(' ')} 2>/dev/null || true`);
       }
     }
     await browser.close();

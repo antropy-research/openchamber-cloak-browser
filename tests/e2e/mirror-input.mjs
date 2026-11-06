@@ -16,6 +16,8 @@ const PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>input test
 <select id="pick"><option>one</option><option>two</option><option>three</option></select>
 <label><input type="checkbox" id="box"> box</label>
 <button id="btn">Click me</button>
+<div id="editor" contenteditable="true" style="border:1px solid #999;padding:4px;width:300px">edit me</div>
+<p>the page's editor: <span id="edited">edit me</span></p>
 <p>clicks: <span id="clicks">0</span> · wheels: <span id="wheels">0</span> · y: <span id="pos">0</span> · focus: <span id="focus">none</span></p>
 <div id="log"></div>
 <div class="tall"></div>
@@ -31,6 +33,7 @@ $('name').addEventListener('keydown', (e) => { if (e.key === 'Enter') note('ente
 window.addEventListener('wheel', () => { wheels += 1; $('wheels').textContent = String(wheels); }, { passive: true });
 window.addEventListener('scroll', () => { $('pos').textContent = String(Math.round(scrollY)); }, { passive: true });
 document.addEventListener('focusin', (e) => { $('focus').textContent = e.target.id || e.target.tagName; });
+$('editor').addEventListener('input', () => { $('edited').textContent = $('editor').textContent; });
 </script></body></html>`;
 
 const results = [];
@@ -75,6 +78,23 @@ try {
   await page.keyboard.press('Enter');
   const composed = await t.waitMirror(async (frame) => (await text(frame, 'log'))?.includes('enter [hello wörld 中文中] trusted'), 5000);
   check('a composition reaches the page as its committed text', composed >= 0, JSON.stringify(await text(mirror(), 'log')));
+
+  // An editable element: the page's echo of each key comes between the keys, and the caret stays where it is.
+  await at('#editor').click({ position: { x: 290, y: 12 } });
+  await page.keyboard.press('End');
+  for (const key of 'xyz') {
+    await page.keyboard.type(key);
+    await sleep(250);
+  }
+  await sleep(1000);
+  const edited = await mirror().evaluate(() => {
+    const editor = document.getElementById('editor');
+    const selection = getSelection();
+    return { text: editor.textContent, offset: selection.anchorOffset, node: selection.anchorNode?.textContent ?? null };
+  });
+  const pageText = await text(mirror(), 'edited');
+  check('typing in an editable element: the page has it, and the caret stays at the end here', pageText === 'edit mexyz' && edited.text === 'edit mexyz' && edited.offset === edited.node?.length, `${JSON.stringify(edited)}; the page's: ${pageText}`);
+  await at('#name').click();
 
   // Tab: the page moves its focus, and the mirror's follows.
   await page.keyboard.press('Tab');

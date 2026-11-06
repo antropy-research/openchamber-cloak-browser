@@ -138,8 +138,14 @@ export function mirrorRecorder(): void {
 
   let observer: MutationObserver;
   /** Shadow roots attached after their host was described: attaching one is no mutation, and the page's attachShadow
-   * is not ours to wrap. Looked for every second (sweepShadows). */
+   * is not ours to wrap. Looked for (sweepShadows) every second on custom elements described without one (a component
+   * whose definition comes later attaches its root then), and in the whole document every second for a small one,
+   * every ten for a large one: the scan runs on the page's own thread. */
   const observedShadows = new WeakSet<ShadowRoot>();
+  const shadowless = new Set<WeakRef<Element>>();
+  /** Elements described since the last snapshot: how large the document is. */
+  let described = 0;
+  let lastFullShadowSweep = 0;
 
   const serialize = (node: Node, parentNs: string | null): Json | null => {
     if (ignored(node)) return null;
@@ -201,7 +207,9 @@ export function mirrorRecorder(): void {
       if (described) children.push(described);
     }
     if (children.length) out.c = children;
+    described += 1;
     const shadow = element.shadowRoot;
+    if (!shadow && tag.includes('-')) shadowless.add(new WeakRef(element));
     if (shadow) {
       const inside: Json[] = [];
       for (const child of Array.from(shadow.childNodes)) {
@@ -377,9 +385,21 @@ export function mirrorRecorder(): void {
     if (now - lastShadowSweep < 1000) return;
     lastShadowSweep = now;
     const ops: unknown[] = [];
-    for (const element of Array.from(document.querySelectorAll('*'))) {
+    const full = now - lastFullShadowSweep >= (described < 30_000 ? 1000 : 10_000);
+    if (full) lastFullShadowSweep = now;
+    const candidates: Element[] = full ? Array.from(document.querySelectorAll('*')) : [];
+    for (const ref of shadowless) {
+      const element = ref.deref();
+      if (!element || !element.isConnected) {
+        shadowless.delete(ref);
+        continue;
+      }
+      if (!full) candidates.push(element);
+    }
+    for (const element of candidates) {
       const shadow = element.shadowRoot;
-      if (!shadow || observedShadows.has(shadow) || !sent.has(element) || detached.has(element)) continue;
+      if (!shadow) continue;
+      if (observedShadows.has(shadow) || !sent.has(element) || detached.has(element)) continue;
       observedShadows.add(shadow);
       observer.observe(shadow, { childList: true, attributes: true, characterData: true, subtree: true });
       ops.push(['S', ids.get(element), childList(shadow, nsOf(element))]);
@@ -442,6 +462,8 @@ export function mirrorRecorder(): void {
     styles.clear();
     controls.clear();
     patchNodes.clear();
+    shadowless.clear();
+    described = 0;
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
     lastFocus = focusedId();

@@ -160,6 +160,16 @@ const chromePid = (dataDir: string): number => {
   return Number(owner.slice(owner.lastIndexOf('-') + 1));
 };
 
+/** The pids of the handover watchdogs watching `dataDir` (browser.ts, WATCHDOG). */
+const watchdogs = (dataDir: string): number[] => readdirSync('/proc').filter((name) => /^\d+$/.test(name)).filter((name) => {
+  try {
+    const command = readFileSync(`/proc/${name}/cmdline`, 'utf8');
+    return command.includes(join(dataDir, 'handover.json')) && command.includes('-e');
+  } catch {
+    return false;
+  }
+}).map(Number);
+
 const alive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
@@ -350,11 +360,34 @@ describe('the browser process', () => {
       const after = await waitFor('the same tabs', () => tabbed(second), (s) => s.phase === 'running' && s.tabs.length === 2 && s.url === `${site}/b`, 30_000);
       expect(chromePid(dataDir)).toBe(pid);
       expect(after.tabs.map((tab) => tab.id)).toEqual(before.tabs.map((tab) => tab.id));
+      // The handover's watchdog saw the claim and went: it would stop the browser after its minute otherwise.
+      await waitFor('the watchdog to go', async () => watchdogs(dataDir).length, (count) => count === 0, 5000);
     } finally {
       for (const service of services) await stopService(service).catch(() => {});
       rmSync(dataDir, { recursive: true, force: true });
     }
   }, 120_000);
+
+  // A handover nobody can take any more (its folder removed: an extension's data cleared, a test's temporary folder):
+  // the watchdog stops the browser at once, not after its minute, and never leaves it running.
+  test('a browser handed over whose handover is removed is stopped at once', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'cloak-test-'));
+    try {
+      const service = await startService(dataDir);
+      await waitFor('the browser to run', () => state(service), (s) => s.phase === 'running', 60_000);
+      await api(service, 'GET', '/mirror/events?after=0&wait=0');
+      const pid = chromePid(dataDir);
+      await stopService(service, 'SIGTERM');
+      await sleep(500);
+      expect(alive(pid)).toBe(true);
+      expect(watchdogs(dataDir).length).toBe(1);
+      rmSync(join(dataDir, 'handover.json'));
+      await waitFor('the browser to stop', async () => alive(pid), (running) => !running, 10_000);
+      await waitFor('the watchdog to go', async () => watchdogs(dataDir).length, (count) => count === 0, 10_000);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 90_000);
 
   test('a browser left by a killed service is stopped when the next one starts; the profile keeps its fingerprint', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'cloak-test-'));

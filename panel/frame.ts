@@ -235,9 +235,14 @@ const patchAt = (x: number, y: number): Element | null => {
   return null;
 };
 
+/** Stand-ins (frames, canvases, video, plugins): they keep their sandbox and never take an address of the page's. */
+const standIns = new WeakSet<Element>();
+const STAND_IN_KEPT = new Set(['src', 'srcdoc', 'srcset', 'data', 'sandbox', 'allow', 'allowfullscreen', 'credentialless', 'csp', 'name']);
+
 const setAttribute = (element: Element, name: string, value: string | null): void => {
   // autofocus would take the keyboard from OpenChamber when a page shows (the page's own focus is the browser's).
   if (/^on/i.test(name) || name === 'srcdoc' || name === 'is' || name === 'autofocus') return;
+  if (standIns.has(element) && STAND_IN_KEPT.has(name.toLowerCase())) return;
   const svgAnimation = element.namespaceURI === NAMESPACES.s && ANIMATIONS.has(element.localName.toLowerCase());
   try {
     if (value === null) {
@@ -247,7 +252,8 @@ const setAttribute = (element: Element, name: string, value: string | null): voi
       return;
     }
     if (scripted(value)) return;
-    if (svgAnimation && (/href/i.test(name === 'attributeName' ? value : '') || (/^(values|to|from|by)$/.test(name) && /(javascript|vbscript):/i.test(value.replace(/[\u0000- ]/g, ''))))) return;
+    // An animation that would set a link's address, or a handler.
+    if (svgAnimation && ((name === 'attributeName' && /href|^\s*on/i.test(value)) || (/^(values|to|from|by)$/.test(name) && /(javascript|vbscript):/i.test(value.replace(/[\u0000- ]/g, ''))))) return;
     if (resourceAttribute(element, name) && isRemote(value)) {
       applyResource(element, name, value);
       return;
@@ -329,6 +335,12 @@ const forget = (node: Node): void => {
 
 /** Elements that would load or run something of their own: an empty stand-in with the same box. */
 const standIn = (desc: Desc): Element => {
+  const made = makeStandIn(desc);
+  standIns.add(made);
+  return made;
+};
+
+const makeStandIn = (desc: Desc): Element => {
   const tag = desc.n ?? 'div';
   if (tag === 'iframe') {
     const frame = document.createElement('iframe');
@@ -414,6 +426,25 @@ const build = (desc: Desc, parentNs: string | null): Node | null => {
   return element;
 };
 
+/**
+ * A text node's text from the page. In an editable element the user is typing in here, the page's echo of the same
+ * keys is most often what the node already holds; when it differs, the caret keeps its place (replacing a node's
+ * text otherwise puts it at the node's start).
+ */
+const setTextData = (text: Text, data: string): void => {
+  if (text.data === data) return;
+  const selection = document.getSelection();
+  const caret = selection && selection.rangeCount && selection.anchorNode === text && selection.isCollapsed ? selection.anchorOffset : null;
+  text.data = data;
+  if (caret !== null && selection) {
+    try {
+      selection.collapse(text, Math.min(caret, data.length));
+    } catch {
+      // the node left the document meanwhile
+    }
+  }
+};
+
 const nsOf = (node: Node): string | null => {
   if (node instanceof ShadowRoot) return nsOf(node.host);
   if (!(node instanceof Element)) return HTML;
@@ -461,7 +492,18 @@ const linkedSheets = (desc: Desc | null, out: Set<string> = new Set()): Set<stri
   return out;
 };
 
+/** What the frame keeps of resources across pages; past it, a new page starts without (the service keeps them). */
+const KEPT_BYTES_MAX = 200_000_000;
+let keptBytes = 0;
+const forgetResources = (): void => {
+  for (const url of blobs.values()) URL.revokeObjectURL(url);
+  blobs.clear();
+  sheets.clear();
+  keptBytes = 0;
+};
+
 const showSnapshot = (message: Snapshot, doc: number): void => {
+  if (doc !== shownDoc && keptBytes > KEPT_BYTES_MAX) forgetResources();
   shownDoc = doc;
   input.reset();
   scrolledAtStart = [];
@@ -538,7 +580,7 @@ const apply = (op: Op): boolean => {
     }
     case 't': {
       const text = nodes.get(op[1] as number);
-      if (text && text.nodeType === Node.TEXT_NODE) (text as Text).data = op[2] as string;
+      if (text && text.nodeType === Node.TEXT_NODE) setTextData(text as Text, op[2] as string);
       return true;
     }
     case 's': {
@@ -593,6 +635,7 @@ const restyle = (): void => {
 const resourceArrived = (url: string, mime: string, content: { data?: string; text?: string }): void => {
   asked.delete(url);
   const bytes = content.text !== undefined ? content.text : Uint8Array.from(atob(content.data ?? ''), (char) => char.charCodeAt(0));
+  keptBytes += typeof bytes === 'string' ? bytes.length : bytes.byteLength;
   if (mime === 'text/css') {
     sheets.set(url, typeof bytes === 'string' ? bytes : new TextDecoder().decode(bytes));
     for (const [element, href] of linked) if (href === url) setCss(element, sheets.get(url) ?? '');

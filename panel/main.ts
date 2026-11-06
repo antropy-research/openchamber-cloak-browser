@@ -7,7 +7,7 @@ import { applyHostReady, mountButton, mountTextField } from '@openchamber/sdk/ui
 import { MirrorView } from './mirror-view.ts';
 
 type Tab = { id: string; title: string; url: string; shown: boolean; agent: boolean; loading: boolean };
-type Controlled = { controller: 'none' | 'agent' | 'user'; mine: boolean };
+type Controlled = { controller: 'none' | 'agent' | 'user'; mine: boolean; agentSeen?: boolean };
 type Dialog = { type: string; message: string; defaultPrompt: string };
 type State = {
   phase: 'idle' | 'preparing' | 'starting' | 'running' | 'failed';
@@ -338,10 +338,16 @@ const show = (text: string, error = false): void => {
   status.dataset.error = String(error);
 };
 
-/** Who works in the browser, in OpenChamber's words for its own surface; '' for nobody. */
+/**
+ * Who works in the browser, in OpenChamber's words for its own surface; '' for nobody. That this window has control
+ * is said only with an agent around (it acted or tried to lately): to someone just browsing it means nothing.
+ */
 const controlText = (next: State): string => {
   if (next.phase !== 'running') return '';
-  if (next.control?.controller === 'user') return next.control.mine ? 'You have control' : 'Another device has control';
+  if (next.control?.controller === 'user') {
+    if (!next.control.mine) return 'Another device has control';
+    return next.control.agentSeen ? 'You have control' : '';
+  }
   if (next.control?.controller === 'agent' || next.agentActive) return 'Agent is working';
   return '';
 };
@@ -412,7 +418,7 @@ const paint = (next: State): void => {
       address = shown;
     }
   }
-  handBackBox.hidden = !(next.control?.controller === 'user' && next.control.mine);
+  handBackBox.hidden = !(next.control?.controller === 'user' && next.control.mine && next.control.agentSeen);
   view.setControl(next.control?.controller === 'user' && next.control.mine);
   status.dataset.control = next.control?.controller === 'user' && next.control.mine ? 'mine' : '';
   if (!shownError || next.phase === 'failed') show(controlText(next) || describe(next), next.phase === 'failed');

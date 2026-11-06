@@ -9,10 +9,12 @@
 //   end; here a click made long ago does not keep the agent out), or close the window (its panel stops asking).
 // - Another window sees who holds control and cannot take it.
 export type Controller = 'none' | 'agent' | 'user';
-export type ControlState = { controller: Controller; mine: boolean };
+/** `agentSeen`: the agent acted, or tried to, lately; without it, who holds control does not matter to anyone. */
+export type ControlState = { controller: Controller; mine: boolean; agentSeen: boolean };
 
 const AGENT_HOLD_MS = 30_000;
 const USER_IDLE_MS = 60_000;
+const AGENT_SEEN_MS = 10 * 60_000;
 /** A window whose panel has not asked for this long is gone. */
 const VIEWER_GONE_MS = 20_000;
 
@@ -24,6 +26,8 @@ export class Control {
   private controller: Controller = 'none';
   private viewer: string | null = null;
   private agentUntil = 0;
+  /** When the agent last acted or tried to: the strip says who holds control only with an agent around. */
+  private agentAt = 0;
   private userAt = 0;
   private readonly seen = new Map<string, number>();
 
@@ -36,7 +40,7 @@ export class Control {
 
   state(viewer: string): ControlState {
     this.settle();
-    return { controller: this.controller, mine: this.controller === 'user' && this.viewer === viewer };
+    return { controller: this.controller, mine: this.controller === 'user' && this.viewer === viewer, agentSeen: Date.now() - this.agentAt < AGENT_SEEN_MS };
   }
 
   /** The user acts in `viewer`'s window: whether it holds control now (false: another window does). */
@@ -70,6 +74,7 @@ export class Control {
   /** The agent is about to act: false while the user holds control (the action is refused). */
   agentActs(): boolean {
     this.settle();
+    this.agentAt = Date.now();
     if (this.controller === 'user') return false;
     const was = this.controller;
     this.controller = 'agent';

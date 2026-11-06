@@ -78,29 +78,40 @@ type Handover = {
   shownId: string | null;
   order: string[];
   tabs: Record<string, { openedBy: string | null; viewport: BrowserViewportMode }>;
+  /** When it was handed over; also the handover's name, which its watchdog knows it by. */
   at: number;
+  /** The service that took it over: its watchdog goes. */
+  claimedBy?: number;
 };
 const HANDOVER_FILE = 'handover.json';
 /** A browser handed over and not taken within this long is stopped. */
 const HANDOVER_MS = 60_000;
 
 /**
- * The watchdog a handover leaves (`node -e`, detached): it stops the browser once HANDOVER_MS pass with the handover
- * still there, and goes once a service took it (the file is gone) or the browser exited.
+ * The watchdog a handover leaves (`node -e`, detached). It goes once a service took the browser over (the handover
+ * says so: `claimedBy`), once another handover replaced its own (another `at`), or once the browser exited. It stops
+ * the browser once HANDOVER_MS pass unclaimed, and at once when the handover is gone (its folder was removed): nobody
+ * can take the browser over then.
  */
 const WATCHDOG = `
 const fs = require('fs');
-const [file, pidText, deadlineText] = process.argv.slice(1);
-const pid = Number(pidText), deadline = Number(deadlineText);
+const [file, pidText, atText, deadlineText] = process.argv.slice(1);
+const pid = Number(pidText), at = Number(atText), deadline = Number(deadlineText);
 const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const stop = () => {
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+  setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch {} process.exit(0); }, 5000);
+};
 const tick = () => {
   let handover = null;
-  try { handover = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
-  if (!handover || handover.pid !== pid) process.exit(0);
-  if (!alive()) { try { fs.rmSync(file, { force: true }); } catch {} process.exit(0); }
+  let gone = false;
+  try { handover = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { gone = error && error.code === 'ENOENT'; }
+  if (!alive()) process.exit(0);
+  if (gone) return stop();
+  if (handover && (handover.at !== at || handover.claimedBy)) process.exit(0);
   if (Date.now() < deadline) { setTimeout(tick, 1000); return; }
-  try { process.kill(pid, 'SIGTERM'); } catch {}
-  setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch {} try { fs.rmSync(file, { force: true }); } catch {} process.exit(0); }, 5000);
+  try { fs.rmSync(file, { force: true }); } catch {}
+  stop();
 };
 tick();
 `;
@@ -350,7 +361,7 @@ export class Browser {
     }
     const env = { ...process.env };
     for (const key of Object.keys(env)) if (key.startsWith('OPENCHAMBER_')) delete env[key];
-    const watchdog = spawn(process.execPath, ['-e', WATCHDOG, file, String(pid), String(handover.at + HANDOVER_MS)], { detached: true, stdio: 'ignore', env });
+    const watchdog = spawn(process.execPath, ['-e', WATCHDOG, file, String(pid), String(handover.at), String(handover.at + HANDOVER_MS)], { detached: true, stdio: 'ignore', env });
     watchdog.unref();
     this.handedOver = true;
     this.cdp.close();
@@ -369,15 +380,28 @@ export class Browser {
     } catch {
       return null;
     }
-    // Taken, whatever comes next: the watchdog goes once the file does.
-    await rm(file, { force: true }).catch(() => {});
-    if (handover.profile !== this.profile || !Number.isInteger(handover.pid) || !alive(handover.pid) || Date.now() - handover.at > HANDOVER_MS) return null;
+    // Taken already (by an earlier start), or not to be taken: the browser on the profile, if any, is stopped as a
+    // leftover (stopLeftover), and the watchdog of one handed over stops it when the handover goes.
+    const usable = async (): Promise<boolean> => {
+      if (handover.claimedBy || handover.profile !== this.profile || !Number.isInteger(handover.pid) || !alive(handover.pid) || Date.now() - handover.at > HANDOVER_MS) return false;
+      try {
+        const command = (await readFile(`/proc/${handover.pid}/cmdline`)).toString('utf8').replaceAll('\0', ' ');
+        if (!command.includes(`--user-data-dir=${this.profile}`)) return false;
+        const port = new URL(handover.ws).port;
+        const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) })).json() as { webSocketDebuggerUrl?: string };
+        return version.webSocketDebuggerUrl === handover.ws;
+      } catch {
+        return false;
+      }
+    };
+    if (!(await usable())) {
+      if (!handover.claimedBy) await rm(file, { force: true }).catch(() => {});
+      return null;
+    }
+    // Claimed: the watchdog sees it and goes. The file stays (the next handover replaces it): were it gone, the
+    // watchdog would take the browser for abandoned.
     try {
-      const command = (await readFile(`/proc/${handover.pid}/cmdline`)).toString('utf8').replaceAll('\0', ' ');
-      if (!command.includes(`--user-data-dir=${this.profile}`)) return null;
-      const port = new URL(handover.ws).port;
-      const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) })).json() as { webSocketDebuggerUrl?: string };
-      if (version.webSocketDebuggerUrl !== handover.ws) return null;
+      await writeFile(file, `${JSON.stringify({ ...handover, claimedBy: process.pid })}\n`);
     } catch {
       return null;
     }

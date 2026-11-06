@@ -1203,17 +1203,23 @@ var HANDOVER_FILE = "handover.json";
 var HANDOVER_MS = 60000;
 var WATCHDOG = `
 const fs = require('fs');
-const [file, pidText, deadlineText] = process.argv.slice(1);
-const pid = Number(pidText), deadline = Number(deadlineText);
+const [file, pidText, atText, deadlineText] = process.argv.slice(1);
+const pid = Number(pidText), at = Number(atText), deadline = Number(deadlineText);
 const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const stop = () => {
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+  setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch {} process.exit(0); }, 5000);
+};
 const tick = () => {
   let handover = null;
-  try { handover = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
-  if (!handover || handover.pid !== pid) process.exit(0);
-  if (!alive()) { try { fs.rmSync(file, { force: true }); } catch {} process.exit(0); }
+  let gone = false;
+  try { handover = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { gone = error && error.code === 'ENOENT'; }
+  if (!alive()) process.exit(0);
+  if (gone) return stop();
+  if (handover && (handover.at !== at || handover.claimedBy)) process.exit(0);
   if (Date.now() < deadline) { setTimeout(tick, 1000); return; }
-  try { process.kill(pid, 'SIGTERM'); } catch {}
-  setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch {} try { fs.rmSync(file, { force: true }); } catch {} process.exit(0); }, 5000);
+  try { fs.rmSync(file, { force: true }); } catch {}
+  stop();
 };
 tick();
 `;
@@ -1418,7 +1424,7 @@ class Browser {
     for (const key of Object.keys(env))
       if (key.startsWith("OPENCHAMBER_"))
         delete env[key];
-    const watchdog = spawn2(process.execPath, ["-e", WATCHDOG, file, String(pid), String(handover.at + HANDOVER_MS)], { detached: true, stdio: "ignore", env });
+    const watchdog = spawn2(process.execPath, ["-e", WATCHDOG, file, String(pid), String(handover.at), String(handover.at + HANDOVER_MS)], { detached: true, stdio: "ignore", env });
     watchdog.unref();
     this.handedOver = true;
     this.cdp.close();
@@ -1435,17 +1441,28 @@ class Browser {
     } catch {
       return null;
     }
-    await rm2(file, { force: true }).catch(() => {});
-    if (handover.profile !== this.profile || !Number.isInteger(handover.pid) || !alive(handover.pid) || Date.now() - handover.at > HANDOVER_MS)
+    const usable = async () => {
+      if (handover.claimedBy || handover.profile !== this.profile || !Number.isInteger(handover.pid) || !alive(handover.pid) || Date.now() - handover.at > HANDOVER_MS)
+        return false;
+      try {
+        const command = (await readFile2(`/proc/${handover.pid}/cmdline`)).toString("utf8").replaceAll("\x00", " ");
+        if (!command.includes(`--user-data-dir=${this.profile}`))
+          return false;
+        const port = new URL(handover.ws).port;
+        const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) })).json();
+        return version.webSocketDebuggerUrl === handover.ws;
+      } catch {
+        return false;
+      }
+    };
+    if (!await usable()) {
+      if (!handover.claimedBy)
+        await rm2(file, { force: true }).catch(() => {});
       return null;
+    }
     try {
-      const command = (await readFile2(`/proc/${handover.pid}/cmdline`)).toString("utf8").replaceAll("\x00", " ");
-      if (!command.includes(`--user-data-dir=${this.profile}`))
-        return null;
-      const port = new URL(handover.ws).port;
-      const version = await (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) })).json();
-      if (version.webSocketDebuggerUrl !== handover.ws)
-        return null;
+      await writeFile2(file, `${JSON.stringify({ ...handover, claimedBy: process.pid })}
+`);
     } catch {
       return null;
     }
@@ -2059,6 +2076,7 @@ class Browser {
 // service/control.ts
 var AGENT_HOLD_MS = 30000;
 var USER_IDLE_MS = 60000;
+var AGENT_SEEN_MS = 10 * 60000;
 var VIEWER_GONE_MS = 20000;
 var USER_HAS_CONTROL = "The user is interacting with this page in the panel right now, so the action was not run. " + "Wait for them to hand control back, or ask them to. Nothing was changed.";
 
@@ -2067,6 +2085,7 @@ class Control {
   controller = "none";
   viewer = null;
   agentUntil = 0;
+  agentAt = 0;
   userAt = 0;
   seen = new Map;
   constructor(changed = () => {}) {
@@ -2078,7 +2097,7 @@ class Control {
   }
   state(viewer) {
     this.settle();
-    return { controller: this.controller, mine: this.controller === "user" && this.viewer === viewer };
+    return { controller: this.controller, mine: this.controller === "user" && this.viewer === viewer, agentSeen: Date.now() - this.agentAt < AGENT_SEEN_MS };
   }
   userActs(viewer) {
     this.settle();
@@ -2107,6 +2126,7 @@ class Control {
   }
   agentActs() {
     this.settle();
+    this.agentAt = Date.now();
     if (this.controller === "user")
       return false;
     const was = this.controller;
@@ -2245,6 +2265,9 @@ function mirrorRecorder() {
   };
   let observer;
   const observedShadows = new WeakSet;
+  const shadowless = new Set;
+  let described = 0;
+  let lastFullShadowSweep = 0;
   const serialize = (node, parentNs) => {
     if (ignored(node))
       return null;
@@ -2310,7 +2333,10 @@ function mirrorRecorder() {
     }
     if (children.length)
       out.c = children;
+    described += 1;
     const shadow = element.shadowRoot;
+    if (!shadow && tag.includes("-"))
+      shadowless.add(new WeakRef(element));
     if (shadow) {
       const inside = [];
       for (const child of Array.from(shadow.childNodes)) {
@@ -2508,9 +2534,24 @@ function mirrorRecorder() {
       return;
     lastShadowSweep = now;
     const ops = [];
-    for (const element of Array.from(document.querySelectorAll("*"))) {
+    const full = now - lastFullShadowSweep >= (described < 30000 ? 1000 : 1e4);
+    if (full)
+      lastFullShadowSweep = now;
+    const candidates = full ? Array.from(document.querySelectorAll("*")) : [];
+    for (const ref of shadowless) {
+      const element = ref.deref();
+      if (!element || !element.isConnected) {
+        shadowless.delete(ref);
+        continue;
+      }
+      if (!full)
+        candidates.push(element);
+    }
+    for (const element of candidates) {
       const shadow = element.shadowRoot;
-      if (!shadow || observedShadows.has(shadow) || !sent.has(element) || detached.has(element))
+      if (!shadow)
+        continue;
+      if (observedShadows.has(shadow) || !sent.has(element) || detached.has(element))
         continue;
       observedShadows.add(shadow);
       observer.observe(shadow, { childList: true, attributes: true, characterData: true, subtree: true });
@@ -2580,6 +2621,8 @@ function mirrorRecorder() {
     styles.clear();
     controls.clear();
     patchNodes.clear();
+    shadowless.clear();
+    described = 0;
     adopted = adoptedText(document.adoptedStyleSheets);
     const root = document.documentElement ? serialize(document.documentElement, null) : null;
     lastFocus = focusedId();
@@ -2729,6 +2772,7 @@ var CACHE_BYTES_MAX = 150000000;
 var PATCH_SCAN_MS = 250;
 var PATCH_MOVING_MS = 250;
 var PATCH_STILL_MS = 1000;
+var SNAPSHOT_BYTES_MAX = 5000000;
 var PATCH_BYTES_MAX = 2000000;
 var PATCH_QUALITY = 75;
 var isText2 = (mime) => mime === "text/css" || mime === "image/svg+xml" || mime.startsWith("text/");
@@ -2754,6 +2798,7 @@ class Mirror {
   patchSeq = 0;
   patchScanAt = 0;
   coverage = 0;
+  tooBig = false;
   patchesWantedAt = 0;
   constructor(browser) {
     this.browser = browser;
@@ -2883,16 +2928,27 @@ class Mirror {
     this.mimeTypes = new Map;
     this.patches = new Map;
     this.coverage = 0;
+    this.tooBig = false;
     this.log = [];
     this.logBytes = 0;
     this.wake();
     this.kick();
   }
   append(message) {
-    const text = JSON.stringify(message);
-    if (message.k === "snap") {
+    let text = JSON.stringify(message);
+    const snapshot = message.k === "snap";
+    if (snapshot) {
       this.log = [];
       this.logBytes = 0;
+      this.tooBig = text.length > SNAPSHOT_BYTES_MAX;
+      if (this.tooBig) {
+        const { url, title } = message;
+        message = { k: "snap", url, title, quirks: false, root: null, adopted: "", scroll: [0, 0] };
+        text = JSON.stringify(message);
+        this.coverage = 1;
+      }
+    } else if (this.tooBig) {
+      return;
     }
     this.seq += 1;
     this.log.push({ seq: this.seq, message, bytes: text.length });
@@ -2983,7 +3039,7 @@ class Mirror {
     const area = found?.view ? found.view[0] * found.view[1] : 0;
     const coverage = area > 0 ? Math.min(1, list.reduce((sum, entry) => sum + entry[3] * entry[4], 0) / area) : 0;
     let changed = Math.abs(coverage - this.coverage) > 0.05;
-    this.coverage = Math.round(coverage * 100) / 100;
+    this.coverage = this.tooBig ? 1 : Math.round(coverage * 100) / 100;
     if (!cdp || !tab.sessionId || !list.length || Date.now() - this.patchesWantedAt > VIEWER_GONE_MS2)
       return changed;
     for (const entry of list) {

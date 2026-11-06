@@ -34,6 +34,11 @@ const CACHE_BYTES_MAX = 150_000_000;
 const PATCH_SCAN_MS = 250;
 const PATCH_MOVING_MS = 250;
 const PATCH_STILL_MS = 1000;
+/**
+ * A snapshot larger than this would not fit OpenChamber's 8 MB for an answer beside what comes with it: such a page
+ * (a DOM of hundreds of thousands of nodes) is shown as a picture instead (`coverage` 1).
+ */
+const SNAPSHOT_BYTES_MAX = 5_000_000;
 /** Patches in one answer, base64 included: the rest come with the next. */
 const PATCH_BYTES_MAX = 2_000_000;
 const PATCH_QUALITY = 75;
@@ -91,6 +96,8 @@ export class Mirror {
   private patchSeq = 0;
   private patchScanAt = 0;
   private coverage = 0;
+  /** The shown document's snapshot was too large to send: the panel shows it as a picture. */
+  private tooBig = false;
   /** When a panel last wanted the pictures: one that shows the whole page as a picture needs none. */
   private patchesWantedAt = 0;
 
@@ -243,6 +250,7 @@ export class Mirror {
     this.mimeTypes = new Map();
     this.patches = new Map();
     this.coverage = 0;
+    this.tooBig = false;
     // A new document: the panel starts over from its snapshot.
     this.log = [];
     this.logBytes = 0;
@@ -251,10 +259,22 @@ export class Mirror {
   }
 
   private append(message: unknown): void {
-    const text = JSON.stringify(message);
-    if ((message as { k?: string }).k === 'snap') {
+    let text = JSON.stringify(message);
+    const snapshot = (message as { k?: string }).k === 'snap';
+    if (snapshot) {
       this.log = [];
       this.logBytes = 0;
+      this.tooBig = text.length > SNAPSHOT_BYTES_MAX;
+      if (this.tooBig) {
+        // Too large to send: an empty page in its place, and the panel shows the page as a picture.
+        const { url, title } = message as { url?: string; title?: string };
+        message = { k: 'snap', url, title, quirks: false, root: null, adopted: '', scroll: [0, 0] };
+        text = JSON.stringify(message);
+        this.coverage = 1;
+      }
+    } else if (this.tooBig) {
+      // Changes to nodes the panel does not have.
+      return;
     }
     this.seq += 1;
     this.log.push({ seq: this.seq, message, bytes: text.length });
@@ -352,7 +372,7 @@ export class Mirror {
     const area = found?.view ? found.view[0] * found.view[1] : 0;
     const coverage = area > 0 ? Math.min(1, list.reduce((sum, entry) => sum + entry[3] * entry[4], 0) / area) : 0;
     let changed = Math.abs(coverage - this.coverage) > 0.05;
-    this.coverage = Math.round(coverage * 100) / 100;
+    this.coverage = this.tooBig ? 1 : Math.round(coverage * 100) / 100;
     if (!cdp || !tab.sessionId || !list.length || Date.now() - this.patchesWantedAt > VIEWER_GONE_MS) return changed;
     for (const entry of list) {
       const [id, x, y, w, h, dx, dy, tag] = entry;
