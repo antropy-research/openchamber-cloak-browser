@@ -3,9 +3,10 @@
 An [OpenChamber](https://github.com/openchamber/openchamber) extension that runs
 [CloakBrowser](https://github.com/CloakHQ/CloakBrowser), a Chromium with
 source-level fingerprint patches, on the OpenChamber server and shows it in
-OpenChamber's panel: a live picture you click and type into, with tabs, back,
-forward, reload and an address field above it. The agent's browser actions run in it
-too: OpenChamber's own `openchamber_web` tool, answered by CloakBrowser.
+OpenChamber's panel: the shown tab's page as HTML you click, type and scroll in,
+with tabs, back, forward, reload and an address field above it. The agent's browser
+actions run in it too: OpenChamber's own `openchamber_web` tool, answered by
+CloakBrowser.
 
 It is the `extensions/cloak-browser` submodule of
 [oc-forge](https://github.com/antropy-research/oc-forge).
@@ -18,15 +19,16 @@ agent can open a tab but cannot read or click it: only the desktop app can drive
 page (`canDriveBrowserPage` in OpenChamber's
 `packages/ui/src/lib/browser/hostCapability.ts`).
 
-OpenChamber has shipped two extension points for this since 2.0, so the extension
-needs no change to OpenChamber (`GUEST_SERVICES.md` in `@openchamber/sdk`):
+The extension needs no change to OpenChamber (`GUEST_SERVICES.md` in
+`@openchamber/sdk`): `service.provides: ["browser"]` sends the agent's `browser.*`
+actions (open, snapshot, click, type, …) to the service once it is picked in
+Settings → General → OpenChamber Tools → Browser provider, and the panel is the
+extension's own page, which reaches the service through `host.serviceRequest`.
 
-- `service.surface: true`: the service hands out frames; OpenChamber draws them in
-  the extension's panel, sends back the pointer, keys, wheel and paste, and keeps
-  track of who is in control (the agent, or you until you hand back).
-- `service.provides: ["browser"]`: the agent's `browser.*` actions (open, snapshot,
-  click, type, …) go to the service once it is picked in Settings → General →
-  OpenChamber Tools → Browser provider.
+OpenChamber also offers a shared surface (`service.surface`: frames out, input in),
+which the extension used before 0.4. It sends pictures: 3 s of scrolling cost 0.7 to
+12 MB, against 14 to 260 KB as HTML (below), and a page docked beside it can take at
+most half the panel.
 
 ## Status
 
@@ -38,75 +40,125 @@ Works: the browser in the panel, and the agent's browser.
   panel opens and restarts after it exits; a browser left behind by a killed service is
   stopped on the next start, and a lock left on the profile by an earlier container over
   the same volume (another hostname, which Chrome refuses) is cleared.
-- **The picture.** The shown tab at the panel's size and the window's pixel ratio
-  (Retina is sharp), sent when the page changes. OpenChamber tells the service the
-  panel's size only when the panel changes size, so after a restart of OpenChamber or
-  the service it would not know it: the service keeps the last size, and the strip has
-  the panel tell it again (one pixel of strip and back) whenever the picture's width is
-  not the panel's.
-- **Input.** Click, double and triple click, drag, wheel, keys; on a Mac, Command acts
-  as Control (the page is Chrome on Windows) and its line and word moves keep their
-  meaning. Paste sends any text, Chinese included; copy hands the selection to your
-  clipboard.
+- **The page as HTML.** A recorder in an isolated world of the shown tab (the page's own
+  scripts see neither it nor its observers) describes the document once, then each change
+  (children, attributes, text, CSSOM rules, form values, scroll, focus, shadow roots,
+  adopted sheets). The panel builds it in a frame of its own and keeps it current; the
+  page is laid out at the panel's size and the window's pixel ratio. Style sheets go by
+  address and, with images and fonts, come through the service from what the page loaded
+  (or over the browser's own network, with its cookies), once per site: the panel never
+  reaches the site. Images load as they come near the view, and what a style names (a
+  background, a font) when the panel's renderer asks for it. A new page stays behind the
+  old one until its style sheets are here. No script of the page's ever runs in the panel:
+  no script element in any namespace, no event handler, no `javascript:` value, no
+  `srcdoc`, no `autofocus`.
+- **Pictures for what HTML cannot carry.** A canvas, a video, another site's frame, an
+  embed: the part the window shows is captured in the page and painted on its stand-in, a
+  few times a second for a canvas or a video and once a second for the rest, sent only when
+  it changed. A click on a pictured frame lands in the frame, at the same place.
+- **The page as a picture**, where HTML cannot show it: when pictured elements take half the
+  window or more (a map, a game), when the panel keeps failing to follow the page, or when
+  you ask (the strip's picture button). A new page starts as HTML again.
+- **Input.** A click, the wheel or a drag lands on the element it was over in the panel, at
+  the same place on it, wherever the page has it (scrolled into view first if needed), as
+  real input: pages see trusted events. Typing shows at once and goes to the page; an input
+  method composes in the panel and its text goes; paste sends any text, never the paste
+  chord. A `<select>` opens its own list in the panel and the pick is made in the page.
+  Scrolling happens in the panel first; the page gets the same wheel or keys and each
+  scroller then takes the page's position, and a scroll with no input of its own (find in
+  page) moves the page instead. Copy and cut are the panel's own (your clipboard); on a
+  Mac, Command acts as Control (the page is Chrome on Windows) and its line and word moves
+  keep their meaning.
 - **The strip.** The tabs (a new one, one shown, one closed; the agent's marked AI),
   back, forward, reload or stop, an address field (a URL, a bare host, or words to
-  search), *Open in your browser*, and what the browser is doing (download progress,
-  loading, errors). A link that opens a new tab shows that tab; a click with Control
-  (Command on a Mac) or the middle button opens it in a tab behind, and the picture
-  stays where it is.
-- **Alerts, confirms and prompts.** The shown tab's wait in a row of the strip (OK,
-  Cancel, the prompt's text); Enter and Escape in the picture answer them too. A tab
-  behind, or one the agent works in, answers its own (OK, the prompt's default).
-- **The browser's keys**, while the picture has the focus (OpenChamber's own
-  shortcuts stand down then): mod+T, mod+W, Control+Tab, mod+PageUp/PageDown, mod+1…9,
-  and OpenChamber's own tab keys mod+Alt+←/→ for the tabs; mod+[ and mod+] (Alt+← and
+  search), the picture button, *Open in your browser*, and what the browser is doing
+  (download progress, loading, errors, who has control). A link that opens a new tab
+  shows that tab; a click with Control (Command on a Mac) or the middle button opens it
+  in a tab behind, and the page stays where it is.
+- **Alerts, confirms and prompts.** The shown tab's appear over the page (OK, Cancel,
+  the prompt's text); Enter and Escape answer them too. A tab behind, or one the agent
+  works in, answers its own (OK, the prompt's default).
+- **The browser's keys**, while the page has the focus: mod+T, mod+W, Control+Tab,
+  mod+PageUp/PageDown, mod+1…9 and mod+Alt+←/→ for the tabs; mod+[ and mod+] (Alt+← and
   Alt+→ off a Mac) for back and forward; mod+R and F5 to reload; mod+L, Alt+D or F6 for
   the address, where what you type right away lands even before the field has the
-  focus. mod is Command on a Mac, else Control. Chrome keeps Control+Tab, mod+T and
-  mod+W for itself in a normal tab; they work in OpenChamber installed as an app.
+  focus. mod is Command on a Mac, else Control. Keys that would act on OpenChamber's
+  window (reload it, go back in its history) stay with the page. Chrome keeps
+  Control+Tab, mod+T and mod+W for itself in a normal tab; they work in OpenChamber
+  installed as an app.
+- **Control**, as OpenChamber's surface had it: the agent holds it for 30 s after each
+  action (*Agent is working*), you take it by acting in the page (moving the pointer is
+  looking: it goes to the page only while you hold control), another window sees
+  *Another device has control* and cannot take it, and the agent's actions are refused
+  with OpenChamber's own message while you hold it. *Hand back to agent* gives it back;
+  so does a minute without input, or closing the window.
+- **The browser outlives its service.** OpenChamber stops a browser provider's service
+  ten minutes after the agent's last action, whoever is browsing. Stopped while a panel
+  is shown, the service leaves the browser running and the next one, which the panel's
+  next request starts, takes it over: tabs, pages, what you typed. Nobody takes it within
+  a minute (the extension was paused or removed): a watchdog stops it.
+- **A panel that is not shown** (closed, or another panel in its place) asks the service
+  for nothing, and catches up when shown again. OpenChamber does not tell a page when its
+  panel is closed: the panel counts as shown while nearly all of it is in view.
+- **Zooming OpenChamber** gives pages the new pixel ratio at once; the browser is never
+  restarted for it.
 - **The agent's browser.** With Cloak Browser as the Browser provider (Settings →
   General → OpenChamber Tools), the agent's twelve `browser.*` actions run here,
   answered in the shapes OpenChamber's own panel uses (its page scripts, adapted).
   `browser.open` opens a tab of the chat's own, behind your page, in a window of its
   own so it runs as a page in front does; without a `tabId`, an action works in the
-  chat's last tab. Clicks and typing are real input (pages see trusted events).
-  `browser.close` closes only the agent's tabs, an unknown `tabId` is refused, and a
-  dialog the action raised is answered and reported. OpenChamber shows *Agent is
-  working* over the picture, and refuses the agent while you hold control.
+  chat's last tab. Clicks and typing are real input. `browser.close` closes only the
+  agent's tabs, an unknown `tabId` is refused, and a dialog the action raised is
+  answered and reported.
+
+What it costs on the wire (dev, a Retina window, OpenChamber's compression), against
+the picture the extension sent before (JPEG 80, ratio 2, 1000×700):
+
+| page | shown after Enter | first view | a scroll (10 wheel steps, 3 s) | 10 s still | one picture | a scroll as pictures |
+|---|---|---|---|---|---|---|
+| en.wikipedia.org/wiki/Web_browser | 1.0 s | 925 KB | 121 KB | 9 KB | 320 KB | 9.3 MB |
+| github.com/openchamber/openchamber | 3.8 s | 552 KB | 259 KB | 11 KB | 207 KB | 3.9 MB |
+| www.bbc.com/news | 2.2 s | 1.4 MB | 122 KB | 11 KB | 210 KB | 11.9 MB |
+| news.ycombinator.com | 2.0 s | 18 KB | 14 KB | 9 KB | 267 KB | 0.7 MB |
+
+A first view costs more than one picture (style sheets, fonts, images), and those come
+once per site: what follows is changes.
 
 Next:
 
-1. What a screencast does not show: `<select>` lists (use the keyboard, or the
-   agent's `browser.select`), file pickers, downloads.
-2. A CloakBrowser key for the newest build (the free build is Chromium 146).
+1. Both ends are Chromium: send less (no style sheets the panel can take as they are,
+   input by position), falling back to this where the window's browser is not.
+2. File pickers, downloads, date and color pickers (type the value meanwhile).
+3. A CloakBrowser key for the newest build (the free build is Chromium 146).
 
-Limits set by OpenChamber's viewer (2.6), which an extension cannot change:
+Limits:
 
-- No input method: Chinese and other composed text reaches the page by paste.
-- Back from another app, OpenChamber puts the keyboard in the chat box (its
-  `refocusAfterWindowFocus` does not count the picture as a text field): click the
-  picture again. The strip hands the keyboard back after each use, so a click on the
-  picture right after the strip keeps it.
-- Cut does not reach your clipboard (the viewer reads the clipboard after copy only).
-- The cursor keeps one shape, and the title above the picture is ASCII (an HTTP
-  header); the strip shows the page's address.
-- One picture for every window: two windows with the panel open share it, at the size
-  of the one that last resized or took control.
+- A page without a doctype shows in standards mode (the panel's frame is a `srcdoc`,
+  which never is in quirks mode): old table layouts can differ a little.
+- The panel's frame may load nothing from the network (OpenChamber's policy for
+  extension pages): what a page loads is fetched through the service, a little later
+  than the page has it.
 
 ## How it runs
 
 | Path | What |
 |---|---|
 | `package.json` | The OpenChamber manifest (`openchamber.contributes`) and the scripts. |
-| `service/main.ts` | The service: OpenChamber's routes (the surface, `/browser-control` for the agent, the strip's `/state`, `/navigate`, `/history`, `/reload`, `/stop`, `/tabs`, `/dialog`, `/address`, `/viewer`). `service/main.js` is its bundle, which OpenChamber runs with its own Node. |
-| `service/browser.ts` | The browser process: launch, profile, tabs (each with its own DevTools session), navigation, dialogs. |
+| `service/main.ts` | The service: OpenChamber's routes (`/browser-control` for the agent; the panel's `/state`, `/navigate`, `/history`, `/reload`, `/stop`, `/tabs`, `/dialog`, `/address`, `/control`, `/mirror/*`). `service/main.js` is its bundle, which OpenChamber runs with its own Node. |
+| `service/browser.ts` | The browser process: launch, handing over and taking over, profile, tabs (each with its own DevTools session), navigation, dialogs. |
+| `service/mirror-recorder.ts` | The recorder in the page's isolated world: the snapshot, the changes, and where the user's input lands. |
+| `service/mirror.ts` | The page as HTML for the panel: the recorder drained while a panel is shown, the long poll, resources, pictures of what HTML cannot carry. |
+| `service/mirror-input.ts` | The panel's input, checked and placed on the page. |
+| `service/control.ts` | Who works in the browser: nobody, the agent, or the user in one window. |
+| `service/surface.ts` | Input as CDP events, the browser's keys, the page's size and pixel ratio, the screencast for the page as a picture. |
 | `service/agent.ts` | The agent's twelve `browser.*` actions. |
 | `service/page-scripts.ts` | What those actions run in a page, adapted from OpenChamber's own panel (`pageActions.ts`, MIT). |
-| `service/address.ts` | What the address field holds, as a URL. |
-| `service/binary.ts` | Where the binary comes from: the free build, or `CLOAKBROWSER_BINARY_PATH`. |
-| `service/surface.ts` | Frames, size and pixel ratio, input, the browser's keys, copy. |
-| `service/cdp.ts` | The DevTools protocol over the browser's WebSocket. |
-| `panel/` | The strip docked above the picture. `panel/main.js` is its bundle. |
+| `service/address.ts`, `binary.ts`, `cdp.ts` | What the address field holds as a URL; where the binary comes from; the DevTools protocol. |
+| `panel/main.ts` | The panel: the strip, the dialog, control, whether the panel is shown. |
+| `panel/mirror-view.ts`, `panel/frame.ts`, `panel/frame-input.ts` | The page as HTML: the view that follows the service, and the frame that builds the page and takes the user's input. |
+| `panel/picture-view.ts`, `panel/keys.ts` | The page as a picture; the key rules both share. |
+
+`panel/main.js`, `panel/frame.js` and `service/main.js` are the bundles.
 
 The host needs Chromium's libraries and fonts; oc-forge's dev image installs them
 (`containers/openchamber-dev/Dockerfile`). The browser runs with
@@ -114,17 +166,18 @@ The host needs Chromium's libraries and fonts; oc-forge's dev image installs the
 requests stall.
 
 Settings, from the service's environment: `OC_CLOAK_DATA_DIR` (profile, fingerprint
-seed, last address, pixel ratio; default `~/.local/share/oc-forge-cloak-browser`),
-`OC_CLOAK_CACHE_DIR` (downloaded builds; `~/.cache/oc-forge-cloak-browser`),
-`OC_CLOAK_START_URL` (a new profile's first page; Google), `CLOAKBROWSER_BINARY_PATH`
-(a Chromium already on the machine instead of the download).
+seed, last address, pixel ratio, a handover; default
+`~/.local/share/oc-forge-cloak-browser`), `OC_CLOAK_CACHE_DIR` (downloaded builds;
+`~/.cache/oc-forge-cloak-browser`), `OC_CLOAK_START_URL` (a new profile's first page;
+Google), `CLOAKBROWSER_BINARY_PATH` (a Chromium already on the machine instead of the
+download).
 
 ## Develop
 
 ```sh
 bun install
 bun run check   # tsc, strict
-bun run build   # panel/main.js, service/main.js
+bun run build   # panel/main.js, panel/frame.js, service/main.js
 bun run test    # end to end: the built service and a real Chromium
 ```
 
@@ -133,9 +186,15 @@ oc-forge's CI rebuilds them and fails when they differ.
 
 The tests start `service/main.js` under Node with a Chromium (`CLOAK_TEST_CHROME`,
 else Playwright's newest, else a system Chrome) against pages they serve, and drive it
-through the routes OpenChamber and the strip use. `tests/e2e/dev.mjs` is the journey
-through oc-forge's dev OpenChamber with the real CloakBrowser (not in CI; it says how
-to run it).
+through the routes OpenChamber and the panel use.
+
+`tests/e2e/` holds the journeys through oc-forge's dev OpenChamber with the real
+CloakBrowser (not in CI; each says how to run it): `dev.mjs` (the whole of it, the
+agent's browser and with `--agent` a real agent), and `mirror-input`, `mirror-patches`,
+`mirror-control`, `mirror-watchdog`, `mirror-hidden` and `mirror-sites` (the table
+above). `--temp` (the default for the `mirror-*` ones) installs this checkout's build
+as a temporary extension with its own id and data, so the Cloak Browser dev runs is
+untouched.
 
 To try it elsewhere, add the folder in OpenChamber's Settings → Extensions, allow its
 local service, and open Cloak Browser in the rail. For the agent, pick Cloak Browser
